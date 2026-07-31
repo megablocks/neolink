@@ -78,6 +78,11 @@ technical references live in [`docs/`](docs/) ([index](docs/README.md)):
 Download from the
 [release page](https://github.com/privatecoder/neolink/releases)
 
+The core and no-default-feature workspace remain validated on Rust 1.88. The
+locked GStreamer 0.25 / GLib-GIO 0.22 dependency stack used by the default
+features and `recording-export` requires Rust 1.92 or newer and is validated on
+Rust 1.96.
+
 ## Config/Usage
 
 ### RTSP
@@ -835,6 +840,15 @@ keyframe and valid ADTS AAC pass the bounded preflight. H.265 is not supported;
 ADPCM cannot be included. Replay duration and compressed-byte limits are
 configurable only within hard safety ceilings. A closed stdout cancels replay
 and triggers bounded camera STOP/connection cleanup.
+
+Some camera firmware sends recording bytes without the terminal replay status
+201. For compatibility, command-5 binary activity arms a bounded 15-second idle
+completion timer. Silence is accepted as a clean ending only after at least one
+complete media packet has decoded and the decoder has no partial packet. The
+timer resets on each later binary envelope; status/XML chatter does not reset
+it. Silence before any decoded media remains subject to the ordinary duration
+or transport-error bounds, while an idle partial packet is a static invalid-media
+failure. An explicit 201 always remains the preferred clean camera ending.
 
 When `--audio required` fails before stdout because AAC is missing, ADPCM-only,
 or invalid, stderr begins with the stable non-secret marker

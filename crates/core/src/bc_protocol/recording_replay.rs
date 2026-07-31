@@ -52,6 +52,10 @@ pub const HARD_RECORDING_REPLAY_BUFFER_SIZE: usize = 32;
 pub const DEFAULT_RECORDING_REPLAY_MAX_DURATION: Duration = Duration::from_secs(15 * 60);
 /// Hard maximum wall time accepted for one stored-recording replay session.
 pub const HARD_RECORDING_REPLAY_MAX_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
+/// Default binary-inactivity period after which a complete replay may end.
+pub const DEFAULT_RECORDING_REPLAY_IDLE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(15);
+/// Hard maximum accepted binary-inactivity completion period.
+pub const HARD_RECORDING_REPLAY_IDLE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default maximum compressed media bytes for one stored-recording replay session.
 pub const DEFAULT_RECORDING_REPLAY_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Hard maximum compressed media bytes accepted for one replay session.
@@ -82,6 +86,12 @@ pub struct RecordingReplayOptions {
     pub stream: RecordingStreamKind,
     /// Maximum wall time before Neolink sends STOP.
     pub max_duration: Duration,
+    /// Binary-inactivity period used by cameras that omit the terminal 201.
+    ///
+    /// The timer is armed and reset only by command-5 binary envelopes. It can
+    /// complete replay only after at least one full BcMedia packet has decoded
+    /// and the decoder retains no partial packet.
+    pub idle_completion_timeout: Duration,
     /// Maximum compressed BcMedia payload bytes delivered to the caller.
     pub max_media_bytes: u64,
     /// Maximum compressed payload bytes retained in the decoded consumer queue.
@@ -116,6 +126,7 @@ impl Default for RecordingReplayOptions {
             channel: 0,
             stream: RecordingStreamKind::Sub,
             max_duration: DEFAULT_RECORDING_REPLAY_MAX_DURATION,
+            idle_completion_timeout: DEFAULT_RECORDING_REPLAY_IDLE_COMPLETION_TIMEOUT,
             max_media_bytes: DEFAULT_RECORDING_REPLAY_MAX_BYTES,
             max_buffered_media_bytes: DEFAULT_RECORDING_REPLAY_MAX_BUFFERED_MEDIA_BYTES,
             buffer_size: DEFAULT_RECORDING_REPLAY_BUFFER_SIZE,
@@ -137,6 +148,13 @@ impl RecordingReplayOptions {
         if self.max_duration.is_zero() || self.max_duration > HARD_RECORDING_REPLAY_MAX_DURATION {
             return Err(Error::Other(
                 "Recording replay duration is outside its safety ceiling",
+            ));
+        }
+        if self.idle_completion_timeout.is_zero()
+            || self.idle_completion_timeout > HARD_RECORDING_REPLAY_IDLE_COMPLETION_TIMEOUT
+        {
+            return Err(Error::Other(
+                "Recording replay idle-completion timeout is outside its safety ceiling",
             ));
         }
         if !(1..=HARD_RECORDING_REPLAY_MAX_BYTES).contains(&self.max_media_bytes) {
@@ -172,6 +190,8 @@ impl RecordingReplayOptions {
 pub enum RecordingReplayEnd {
     /// The camera ended its pushed BcMedia stream.
     CameraEnd,
+    /// Binary replay traffic became idle after complete media was delivered.
+    IdleComplete,
     /// The configured wall-time limit was reached.
     DurationLimit,
     /// Delivering another media packet would exceed the configured byte limit.
@@ -465,6 +485,16 @@ fn media_payload_len(media: &BcMedia) -> u64 {
     }
 }
 
+fn idle_completion(
+    decoded_media: bool,
+    media_buffer: &BytesMut,
+) -> Result<Option<RecordingReplayEnd>> {
+    if !media_buffer.is_empty() {
+        return Err(Error::RecordingReplayInvalidMedia);
+    }
+    Ok(decoded_media.then_some(RecordingReplayEnd::IdleComplete))
+}
+
 fn start_request(
     identifier: String,
     uid: String,
@@ -651,6 +681,10 @@ async fn run_replay_session(
         let mut delivered_bytes = 0u64;
         let deadline = tokio::time::sleep(options.max_duration);
         tokio::pin!(deadline);
+        let idle_deadline = tokio::time::sleep(options.idle_completion_timeout);
+        tokio::pin!(idle_deadline);
+        let mut idle_armed = false;
+        let mut decoded_media = false;
         let mut media_decoder = BcMediaCodex::new(options.strict);
         let mut media_buffer = BytesMut::new();
 
@@ -660,7 +694,23 @@ async fn run_replay_session(
                 _ = cancel.cancelled() => return Ok(RecordingReplayEnd::Cancelled),
                 _ = &mut deadline => return Ok(RecordingReplayEnd::DurationLimit),
                 _ = raw_overflow.cancelled() => return Ok(RecordingReplayEnd::ConsumerStalled),
-                message = subscription.recv() => message?,
+                // A queued terminal 201 wins over an idle deadline reached in
+                // the same scheduler turn. Non-binary status traffic does not
+                // reset the timer; the post-message check below prevents such
+                // traffic from starving an already elapsed idle deadline.
+                message = subscription.recv() => Some(message?),
+                _ = &mut idle_deadline, if idle_armed => None,
+            };
+
+            let Some(message) = message else {
+                idle_armed = false;
+                if let Some(end) = idle_completion(decoded_media, &media_buffer)? {
+                    return Ok(end);
+                }
+                // Binary activity with no complete media cannot turn silence
+                // into success. Leave idle completion disarmed so the existing
+                // duration or transport error bound remains authoritative.
+                continue;
             };
 
             let response_code = message.meta.response_code;
@@ -679,10 +729,17 @@ async fn run_replay_session(
                 _ => None,
             };
             if let Some(binary) = binary {
+                // Only replay binary activity arms or extends compatibility
+                // completion; header/XML chatter is not media progress.
+                idle_deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + options.idle_completion_timeout);
+                idle_armed = true;
                 let mut binary_offset = 0usize;
                 loop {
                     while let Some(packet) = media_decoder.decode(&mut media_buffer)? {
                         let packet_bytes = media_payload_len(&packet);
+                        decoded_media |= packet_bytes > 0;
                         let Some(next_bytes) = delivered_bytes.checked_add(packet_bytes) else {
                             return Ok(RecordingReplayEnd::ByteLimit);
                         };
@@ -738,6 +795,13 @@ async fn run_replay_session(
             // are continuation envelopes.
             if response_code == 201 {
                 return Ok(RecordingReplayEnd::CameraEnd);
+            }
+
+            if idle_armed && idle_deadline.is_elapsed() {
+                idle_armed = false;
+                if let Some(end) = idle_completion(decoded_media, &media_buffer)? {
+                    return Ok(end);
+                }
             }
         }
     }
@@ -1086,6 +1150,10 @@ mod tests {
         .unwrap()
     }
 
+    fn info_v1() -> Vec<u8> {
+        include_bytes!("../bcmedia/samples/info_v1.raw").to_vec()
+    }
+
     fn iframe_with_additional_header(payload_bytes: usize, header_bytes: usize) -> Vec<u8> {
         let mut plain = iframe(payload_bytes);
         let current_header_bytes = u32::from_le_bytes(plain[12..16].try_into().unwrap()) as usize;
@@ -1211,6 +1279,32 @@ mod tests {
         start
     }
 
+    async fn start_acknowledged_replay(
+        camera: Arc<BcCamera>,
+        outbound: &mut UnboundedReceiver<Bc>,
+        inbound: &TestInbound,
+        replay_options: RecordingReplayOptions,
+    ) -> (RecordingReplay, Bc) {
+        let start = tokio::spawn(async move {
+            camera
+                .start_recording_replay(&entry(), replay_options)
+                .await
+        });
+        let request = expect_replay_start(outbound).await;
+        inbound
+            .unbounded_send(Ok(modern_reply(&request, 200, None)))
+            .unwrap();
+        (start.await.unwrap().unwrap(), request)
+    }
+
+    fn idle_options() -> RecordingReplayOptions {
+        RecordingReplayOptions {
+            max_duration: Duration::from_secs(60),
+            idle_completion_timeout: DEFAULT_RECORDING_REPLAY_IDLE_COMPLETION_TIMEOUT,
+            ..options(0)
+        }
+    }
+
     #[test]
     fn stop_token_accepts_supported_names_without_exposing_them_in_errors() {
         assert_eq!(
@@ -1226,7 +1320,12 @@ mod tests {
 
     #[test]
     fn options_enforce_every_hard_safety_ceiling() {
-        assert!(RecordingReplayOptions::default().validate().is_ok());
+        let defaults = RecordingReplayOptions::default();
+        assert!(defaults.validate().is_ok());
+        assert_eq!(
+            defaults.idle_completion_timeout,
+            DEFAULT_RECORDING_REPLAY_IDLE_COMPLETION_TIMEOUT
+        );
         let value = RecordingReplayOptions {
             channel: 32,
             ..Default::default()
@@ -1262,6 +1361,16 @@ mod tests {
             ..Default::default()
         };
         assert!(value.validate().is_err());
+        for idle_completion_timeout in [
+            Duration::ZERO,
+            HARD_RECORDING_REPLAY_IDLE_COMPLETION_TIMEOUT + Duration::from_nanos(1),
+        ] {
+            let value = RecordingReplayOptions {
+                idle_completion_timeout,
+                ..Default::default()
+            };
+            assert!(value.validate().is_err());
+        }
     }
 
     #[tokio::test]
@@ -1548,6 +1657,237 @@ mod tests {
             RecordingReplayEnd::CameraEnd
         );
         device.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_binary_data_never_becomes_idle_success() {
+        let (camera, mut outbound, inbound) = test_camera(0).await;
+        let (mut replay, _) =
+            start_acknowledged_replay(camera, &mut outbound, &inbound, idle_options()).await;
+
+        tokio::time::advance(DEFAULT_RECORDING_REPLAY_IDLE_COMPLETION_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !replay.handle.as_ref().unwrap().is_finished(),
+            "idle completion must remain disarmed without binary activity"
+        );
+
+        tokio::time::advance(
+            Duration::from_secs(60) - DEFAULT_RECORDING_REPLAY_IDLE_COMPLETION_TIMEOUT,
+        )
+        .await;
+        let _ = expect_stop_once(&mut outbound, &inbound, 200).await;
+        assert!(matches!(
+            replay.get_data().await,
+            Err(Error::StreamFinished)
+        ));
+        assert_eq!(
+            replay.shutdown().await.unwrap(),
+            RecordingReplayEnd::DurationLimit
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn info_only_binary_never_becomes_idle_success() {
+        let (camera, mut outbound, inbound) = test_camera(0).await;
+        let (mut replay, request) =
+            start_acknowledged_replay(camera, &mut outbound, &inbound, idle_options()).await;
+        inbound
+            .unbounded_send(Ok(binary_message(&request, info_v1())))
+            .unwrap();
+        assert!(matches!(
+            replay.get_data().await.unwrap().unwrap(),
+            BcMedia::InfoV1(_)
+        ));
+
+        tokio::time::advance(DEFAULT_RECORDING_REPLAY_IDLE_COMPLETION_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !replay.handle.as_ref().unwrap().is_finished(),
+            "zero-payload metadata must not count as delivered recording media"
+        );
+
+        tokio::time::advance(
+            Duration::from_secs(60) - DEFAULT_RECORDING_REPLAY_IDLE_COMPLETION_TIMEOUT,
+        )
+        .await;
+        let _ = expect_stop_once(&mut outbound, &inbound, 200).await;
+        assert!(matches!(
+            replay.get_data().await,
+            Err(Error::StreamFinished)
+        ));
+        assert_eq!(
+            replay.shutdown().await.unwrap(),
+            RecordingReplayEnd::DurationLimit
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_binary_burst_becomes_idle_complete_after_fifteen_seconds() {
+        let (camera, mut outbound, inbound) = test_camera(0).await;
+        let (mut replay, request) =
+            start_acknowledged_replay(camera, &mut outbound, &inbound, idle_options()).await;
+        inbound
+            .unbounded_send(Ok(binary_message(&request, iframe(3))))
+            .unwrap();
+        assert!(matches!(
+            replay.get_data().await.unwrap().unwrap(),
+            BcMedia::Iframe(_)
+        ));
+
+        tokio::time::advance(Duration::from_secs(14)).await;
+        tokio::task::yield_now().await;
+        assert!(!replay.handle.as_ref().unwrap().is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let _ = expect_stop_once(&mut outbound, &inbound, 200).await;
+        assert!(matches!(
+            replay.get_data().await,
+            Err(Error::StreamFinished)
+        ));
+        assert_eq!(
+            replay.shutdown().await.unwrap(),
+            RecordingReplayEnd::IdleComplete
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn later_binary_chunk_resets_idle_completion_deadline() {
+        let (camera, mut outbound, inbound) = test_camera(0).await;
+        let (mut replay, request) =
+            start_acknowledged_replay(camera, &mut outbound, &inbound, idle_options()).await;
+        inbound
+            .unbounded_send(Ok(binary_message(&request, iframe(3))))
+            .unwrap();
+        replay.get_data().await.unwrap().unwrap();
+
+        tokio::time::advance(Duration::from_secs(14)).await;
+        inbound
+            .unbounded_send(Ok(binary_message(&request, iframe(4))))
+            .unwrap();
+        replay.get_data().await.unwrap().unwrap();
+        tokio::time::advance(Duration::from_secs(14)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !replay.handle.as_ref().unwrap().is_finished(),
+            "the first binary deadline must not survive later binary activity"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let _ = expect_stop_once(&mut outbound, &inbound, 200).await;
+        assert!(matches!(
+            replay.get_data().await,
+            Err(Error::StreamFinished)
+        ));
+        assert_eq!(
+            replay.shutdown().await.unwrap(),
+            RecordingReplayEnd::IdleComplete
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_binary_status_xml_neither_resets_nor_starves_idle_completion() {
+        let (camera, mut outbound, inbound) = test_camera(0).await;
+        let (mut replay, request) =
+            start_acknowledged_replay(camera, &mut outbound, &inbound, idle_options()).await;
+        inbound
+            .unbounded_send(Ok(binary_message(&request, iframe(3))))
+            .unwrap();
+        replay.get_data().await.unwrap().unwrap();
+
+        tokio::time::advance(Duration::from_secs(14)).await;
+        inbound
+            .unbounded_send(Ok(modern_reply(
+                &request,
+                60_052,
+                Some(BcPayloads::BcXml(BcXml::default())),
+            )))
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let _ = expect_stop_once(&mut outbound, &inbound, 200).await;
+        assert!(matches!(
+            replay.get_data().await,
+            Err(Error::StreamFinished)
+        ));
+        assert_eq!(
+            replay.shutdown().await.unwrap(),
+            RecordingReplayEnd::IdleComplete
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_201_at_idle_boundary_wins_as_camera_end() {
+        let (camera, mut outbound, inbound) = test_camera(0).await;
+        let (mut replay, request) =
+            start_acknowledged_replay(camera, &mut outbound, &inbound, idle_options()).await;
+        inbound
+            .unbounded_send(Ok(binary_message(&request, iframe(3))))
+            .unwrap();
+        replay.get_data().await.unwrap().unwrap();
+
+        tokio::time::advance(Duration::from_secs(14)).await;
+        inbound
+            .unbounded_send(Ok(modern_reply(&request, 201, None)))
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let _ = expect_stop_once(&mut outbound, &inbound, 200).await;
+        assert!(matches!(
+            replay.get_data().await,
+            Err(Error::StreamFinished)
+        ));
+        assert_eq!(
+            replay.shutdown().await.unwrap(),
+            RecordingReplayEnd::CameraEnd
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_with_partial_decoder_tail_is_static_invalid_media_error() {
+        let (camera, mut outbound, inbound) = test_camera(0).await;
+        let (mut replay, request) =
+            start_acknowledged_replay(camera, &mut outbound, &inbound, idle_options()).await;
+        let mut binary = iframe(3);
+        let partial = iframe(4);
+        binary.extend_from_slice(&partial[..partial.len() - 1]);
+        inbound
+            .unbounded_send(Ok(binary_message(&request, binary)))
+            .unwrap();
+        replay.get_data().await.unwrap().unwrap();
+
+        tokio::time::advance(DEFAULT_RECORDING_REPLAY_IDLE_COMPLETION_TIMEOUT).await;
+        let _ = expect_stop_once(&mut outbound, &inbound, 200).await;
+        let error = replay.get_data().await.unwrap().unwrap_err();
+        assert!(matches!(error, Error::RecordingReplayInvalidMedia));
+        assert_eq!(
+            error.to_string(),
+            "Recording replay ended with an incomplete media packet"
+        );
+        assert!(!error.to_string().contains("PRIVATE"));
+        assert!(matches!(
+            replay.shutdown().await,
+            Err(Error::RecordingReplayInvalidMedia)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_before_idle_preserves_stop_failure_and_stops_once() {
+        let (camera, mut outbound, inbound) = test_camera(0).await;
+        let (mut replay, request) =
+            start_acknowledged_replay(camera, &mut outbound, &inbound, idle_options()).await;
+        inbound
+            .unbounded_send(Ok(binary_message(&request, iframe(3))))
+            .unwrap();
+        replay.get_data().await.unwrap().unwrap();
+        tokio::time::advance(Duration::from_secs(14)).await;
+
+        let shutdown = tokio::spawn(async move { replay.shutdown().await });
+        let _ = expect_stop_once(&mut outbound, &inbound, 501).await;
+        assert!(matches!(
+            shutdown.await.unwrap(),
+            Err(Error::RecordingReplayStopFailed { .. })
+        ));
     }
 
     #[tokio::test]

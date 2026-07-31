@@ -283,6 +283,10 @@ pub enum Error {
         stop: std::sync::Arc<Error>,
     },
 
+    /// A replay became idle while retaining an incomplete BcMedia packet.
+    #[error("Recording replay ended with an incomplete media packet")]
+    RecordingReplayInvalidMedia,
+
     /// Raised when a thread panics
     #[error("Thread panicked")]
     JoinError(#[from] std::sync::Arc<tokio::task::JoinError>),

@@ -463,7 +463,9 @@ impl ReplayFeed for CameraReplay {
 
 fn replay_item_error(error: &NeolinkError) -> ExportFailure {
     match error {
-        NeolinkError::NomError(_) | NeolinkError::NomIncomplete(_) => {
+        NeolinkError::NomError(_)
+        | NeolinkError::NomIncomplete(_)
+        | NeolinkError::RecordingReplayInvalidMedia => {
             RecordingExportFailureCategory::ReplayInvalidMedia.failure()
         }
         NeolinkError::RecordingReplayAndStopFailed { replay, .. } => {
@@ -575,7 +577,7 @@ async fn drive_and_shutdown<F: ReplayFeed>(
 
 fn replay_end_result(end: RecordingReplayEnd) -> ExportResult<()> {
     match end {
-        RecordingReplayEnd::CameraEnd => Ok(()),
+        RecordingReplayEnd::CameraEnd | RecordingReplayEnd::IdleComplete => Ok(()),
         RecordingReplayEnd::DurationLimit => {
             Err(RecordingExportFailureCategory::ReplayDurationLimit.failure())
         }
@@ -1431,6 +1433,7 @@ mod tests {
         for error in [
             NeolinkError::NomError(private.to_owned()),
             NeolinkError::NomIncomplete(1),
+            NeolinkError::RecordingReplayInvalidMedia,
         ] {
             let failure = replay_item_error(&error);
             assert_eq!(
@@ -2861,5 +2864,10 @@ mod tests {
                 .clone();
             assert_fragmented_mp4(&bytes);
         }
+    }
+
+    #[test]
+    fn idle_completion_is_a_clean_export_ending() {
+        assert_eq!(replay_end_result(RecordingReplayEnd::IdleComplete), Ok(()));
     }
 }
