@@ -137,14 +137,18 @@ Stored recording searches are a cursor flow:
 3. `CLOSE` (16) releases the handle.
 
 The request keeps the logical channel inside the XML payload and uses host
-channel `250` in the BC header. After a successful OPEN, the client makes a
-best-effort CLOSE attempt on every completed path, including when pagination
-fails or hits a configured page/entry ceiling. Cancelling the asynchronous
-search can interrupt that cleanup, so this is not a cancellation-safe guarantee.
-A header-only `400` reply to GET is treated as end-of-results; other non-200
-responses remain errors. Recording XML is redacted from protocol-debug,
-parse-error, and unmatched-response logs because it can contain device UID and
-recording paths.
+channel `250` in the BC header. The device UID is obtained with the existing UID
+command, and one FileInfoList cursor flow is allowed at a time per `BcCamera`.
+After a successful OPEN, the client makes a best-effort CLOSE attempt on every
+completed path, including when pagination fails or hits a configured page/entry
+ceiling. Cancelling the asynchronous search can interrupt that cleanup, so this
+is not a cancellation-safe guarantee.
+
+A header-only `400` reply to GET is treated as end-of-results. An HTTP-style
+`200` GET with no FileInfoList payload is an empty page, and any `200` CLOSE
+acknowledges cleanup regardless of its payload layout; other non-200 responses
+remain errors. Recording XML is redacted from protocol-debug, parse-error, and
+unmatched-response logs because it can contain device UID and recording paths.
 
 ### `GET_ENC` (56) — live encoder config
 

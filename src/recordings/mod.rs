@@ -1,7 +1,6 @@
 use anyhow::{bail, Context, Result};
-use neolink_core::{
-    bc::xml::FileDateTime,
-    bc_protocol::{RecordingSearchOptions, RecordingSearchResult, RecordingStreamKind},
+use neolink_core::bc_protocol::{
+    FileDateTime, RecordingSearchOptions, RecordingSearchResult, RecordingStreamKind,
 };
 use serde_json::json;
 

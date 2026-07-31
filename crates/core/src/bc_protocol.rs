@@ -8,7 +8,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicU16, Ordering},
     time::Duration,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use Md5Trunc::*;
 
@@ -54,9 +54,9 @@ pub use motion::{MotionData, MotionStatus};
 pub use pirstate::PirState;
 pub use ptz::Direction;
 pub use recordings::{
-    RecordingEntry, RecordingSearchEnd, RecordingSearchOptions, RecordingSearchResult,
-    RecordingStreamKind, DEFAULT_RECORDING_MAX_ENTRIES, DEFAULT_RECORDING_MAX_PAGES,
-    HARD_RECORDING_MAX_ENTRIES, HARD_RECORDING_MAX_PAGES,
+    FileDateTime, RecordingEntry, RecordingSearchEnd, RecordingSearchOptions,
+    RecordingSearchResult, RecordingStreamKind, DEFAULT_RECORDING_MAX_ENTRIES,
+    DEFAULT_RECORDING_MAX_PAGES, HARD_RECORDING_MAX_ENTRIES, HARD_RECORDING_MAX_PAGES,
 };
 pub use resolution::*;
 use std::sync::Arc;
@@ -95,6 +95,8 @@ pub struct BcCamera {
     /// Features (e.g. "battery", "floodlight_tasks") the camera has rejected as
     /// unsupported, so the doomed request is not re-sent on this connection.
     unsupported: RwLock<HashSet<String>>,
+    /// Serializes FileInfoList cursors, which are stateful on the camera.
+    recording_search_lock: Mutex<()>,
 }
 
 /// Options used to construct a camera
@@ -399,6 +401,7 @@ impl BcCamera {
             credentials: Credentials::new(username, passwd),
             abilities: Default::default(),
             unsupported: Default::default(),
+            recording_search_lock: Default::default(),
         };
         me.keepalive().await?;
         Ok(me)

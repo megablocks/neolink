@@ -187,6 +187,9 @@ pub struct FileInfoList {
     /// XML schema version.
     #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Top-level server-side search cursor used by some firmware.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<u32>,
     /// FileInfo request or result entries.
     #[serde(rename = "FileInfo", default, skip_serializing_if = "Vec::is_empty")]
     pub file_info: Vec<FileInfo>,
@@ -283,6 +286,12 @@ pub struct FileResultList {
     /// FileInfo result entries.
     #[serde(rename = "FileInfo", default, skip_serializing_if = "Vec::is_empty")]
     pub file_info: Vec<FileInfo>,
+    /// Pagination completion marker used by some nested response layouts.
+    #[serde(rename = "bFinished", skip_serializing_if = "Option::is_none")]
+    pub b_finished: Option<u8>,
+    /// Alternate nested pagination completion marker.
+    #[serde(rename = "finished", skip_serializing_if = "Option::is_none")]
+    pub finished: Option<u8>,
 }
 
 /// Camera-local date/time fields used by FileInfoList.
@@ -2387,6 +2396,16 @@ fn test_file_info_list_open_fixture() {
 }
 
 #[test]
+fn test_file_info_list_top_level_handle_fixture() {
+    let parsed =
+        BcXml::try_parse(include_bytes!("samples/file_info_list_open_top_level.xml").as_slice())
+            .unwrap();
+    let list = parsed.file_info_list.unwrap();
+    assert_eq!(list.handle, Some(23));
+    assert!(list.file_info.is_empty());
+}
+
+#[test]
 fn test_file_info_list_direct_fixture() {
     let parsed =
         BcXml::try_parse(include_bytes!("samples/file_info_list_page_direct.xml").as_slice())
@@ -2442,7 +2461,8 @@ fn test_file_info_list_nested_fixture() {
     let nested = list.file_info[0].file_list.as_ref().unwrap();
     assert_eq!(nested.file.len(), 1);
     assert_eq!(nested.file[0].type_.as_deref(), Some("md"));
-    assert_eq!(list.finished, Some(1));
+    assert_eq!(nested.b_finished, Some(1));
+    assert_eq!(list.finished, None);
 }
 
 #[test]
@@ -2453,4 +2473,12 @@ fn test_file_info_list_empty_fixture() {
     let list = parsed.file_info_list.unwrap();
     assert!(list.file.is_empty());
     assert_eq!(list.file_info.len(), 1);
+}
+
+#[test]
+fn test_generic_empty_body_fixture() {
+    let parsed =
+        BcXml::try_parse(include_bytes!("samples/file_info_list_generic_empty.xml").as_slice())
+            .unwrap();
+    assert_eq!(parsed, BcXml::default());
 }

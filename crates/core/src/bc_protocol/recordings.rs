@@ -1,7 +1,12 @@
 use super::{BcCamera, Error, Result};
-use crate::bc::{model::*, xml::*};
+use crate::bc::{
+    model::*,
+    xml::{FileInfo, FileInfoList},
+};
 use serde::Serialize;
 use std::{collections::HashSet, future::Future, sync::Arc, time::Duration};
+
+pub use crate::bc::xml::FileDateTime;
 
 const FILE_INFO_LIST_VERSION: &str = "1.1";
 const FILE_INFO_LIST_HOST_CHANNEL: u8 = 250;
@@ -57,11 +62,28 @@ pub struct RecordingSearchOptions {
 }
 
 impl Default for RecordingSearchOptions {
+    /// Return a valid, bounded full-day placeholder query for 2000-01-01.
+    ///
+    /// Callers should replace the date/channel fields for their intended search.
     fn default() -> Self {
         Self {
             channel: 0,
-            start: FileDateTime::default(),
-            end: FileDateTime::default(),
+            start: FileDateTime {
+                year: 2000,
+                month: 1,
+                day: 1,
+                hour: 0,
+                minute: 0,
+                second: 0,
+            },
+            end: FileDateTime {
+                year: 2000,
+                month: 1,
+                day: 1,
+                hour: 23,
+                minute: 59,
+                second: 59,
+            },
             stream: RecordingStreamKind::Sub,
             record_types:
                 "manual, sched, io, md, people, face, vehicle, dog_cat, visitor, other, package"
@@ -261,13 +283,17 @@ impl BcCamera {
         options: RecordingSearchOptions,
     ) -> Result<RecordingSearchResult> {
         options.validate()?;
-        let uid = self.uid().await?;
-        if uid.trim().is_empty() {
-            return Err(Error::Other("Camera returned an empty UID"));
-        }
-        let request = SearchRequest { uid, options };
-        execute_search(request, |msg_id, payload| {
-            self.send_file_info_list(msg_id, payload)
+        with_recording_lock(&self.recording_search_lock, async {
+            let uid = self.uid().await?;
+            let uid = uid.trim().to_owned();
+            if uid.is_empty() {
+                return Err(Error::Other("Camera returned an empty UID"));
+            }
+            let request = SearchRequest { uid, options };
+            execute_search(request, |msg_id, payload| {
+                self.send_file_info_list(msg_id, payload)
+            })
+            .await
         })
         .await
     }
@@ -304,6 +330,9 @@ impl BcCamera {
             .await
             .map_err(|_| Error::TimeoutDisconnected)??;
         let response_code = reply.meta.response_code;
+        if msg_id == MSG_ID_FILE_INFO_LIST_CLOSE && response_code == 200 {
+            return Ok(FileInfoCommandReply::Empty);
+        }
         let payload = match reply.body {
             BcBody::ModernMsg(ModernMsg { payload, .. }) => payload,
             _ => {
@@ -313,27 +342,46 @@ impl BcCamera {
             }
         };
 
-        if msg_id == MSG_ID_FILE_INFO_LIST_GET && response_code == 400 && payload.is_none() {
-            return Ok(FileInfoCommandReply::End);
-        }
-        if response_code != 200 {
-            return Err(Error::CameraServiceUnavailable {
-                id: msg_id,
-                code: response_code,
-            });
-        }
-
-        match payload {
-            Some(BcPayloads::BcXml(BcXml {
-                file_info_list: Some(list),
-                ..
-            })) => Ok(FileInfoCommandReply::Xml(list)),
-            None => Ok(FileInfoCommandReply::Empty),
-            _ => Err(Error::Other(
-                "FileInfoList camera reply had an unexpected payload",
-            )),
-        }
+        classify_file_info_reply(msg_id, response_code, payload)
     }
+}
+
+fn classify_file_info_reply(
+    msg_id: u32,
+    response_code: u16,
+    payload: Option<BcPayloads>,
+) -> Result<FileInfoCommandReply> {
+    if msg_id == MSG_ID_FILE_INFO_LIST_GET && response_code == 400 && payload.is_none() {
+        return Ok(FileInfoCommandReply::End);
+    }
+    if response_code != 200 {
+        return Err(Error::CameraServiceUnavailable {
+            id: msg_id,
+            code: response_code,
+        });
+    }
+    if msg_id == MSG_ID_FILE_INFO_LIST_CLOSE {
+        return Ok(FileInfoCommandReply::Empty);
+    }
+
+    match payload {
+        Some(BcPayloads::BcXml(BcXml {
+            file_info_list: Some(list),
+            ..
+        })) => Ok(FileInfoCommandReply::Xml(list)),
+        None | Some(BcPayloads::BcXml(_)) => Ok(FileInfoCommandReply::Empty),
+        Some(BcPayloads::Binary(_)) => Err(Error::Other(
+            "FileInfoList camera reply had an unexpected binary payload",
+        )),
+    }
+}
+
+async fn with_recording_lock<T>(
+    lock: &tokio::sync::Mutex<()>,
+    operation: impl Future<Output = T>,
+) -> T {
+    let _guard = lock.lock().await;
+    operation.await
 }
 
 async fn execute_search<F, Fut>(
@@ -461,7 +509,7 @@ fn build_open_request(request: &SearchRequest) -> FileInfoList {
     FileInfoList {
         version: Some(FILE_INFO_LIST_VERSION.to_owned()),
         file_info: vec![FileInfo {
-            uid: Some(request.uid.clone()),
+            uid: Some(request.uid.trim().to_owned()),
             search_ai_track: Some(1),
             channel_id: Some(request.options.channel),
             logic_chn_bitmap: Some(255),
@@ -479,7 +527,7 @@ fn build_page_request(request: &SearchRequest, handle: u32) -> FileInfoList {
     FileInfoList {
         version: Some(FILE_INFO_LIST_VERSION.to_owned()),
         file_info: vec![FileInfo {
-            uid: Some(request.uid.clone()),
+            uid: Some(request.uid.trim().to_owned()),
             search_ai_track: Some(1),
             channel_id: Some(request.options.channel),
             handle: Some(handle),
@@ -490,7 +538,12 @@ fn build_page_request(request: &SearchRequest, handle: u32) -> FileInfoList {
 }
 
 fn find_handle(list: &FileInfoList) -> Option<u32> {
-    list.file_info.iter().find_map(find_handle_in_entry)
+    list.handle.or_else(|| {
+        list.file_info
+            .iter()
+            .chain(list.file.iter())
+            .find_map(find_handle_in_entry)
+    })
 }
 
 fn find_handle_in_entry(entry: &FileInfo) -> Option<u32> {
@@ -558,6 +611,8 @@ fn merge_entry_completion_marker(state: &mut Option<bool>, entry: &FileInfo) {
         .into_iter()
         .flatten()
     {
+        merge_completion_marker(state, list.b_finished);
+        merge_completion_marker(state, list.finished);
         for child in list.file.iter().chain(list.file_info.iter()) {
             merge_entry_completion_marker(state, child);
         }
@@ -596,7 +651,14 @@ fn days_in_month(year: u16, month: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::RefCell, collections::VecDeque, future::ready, rc::Rc};
+    use crate::bc::xml::FileResultList;
+    use std::{
+        cell::RefCell,
+        collections::VecDeque,
+        future::ready,
+        rc::Rc,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     fn timestamp(hour: u8) -> FileDateTime {
         FileDateTime {
@@ -628,7 +690,7 @@ mod tests {
 
     fn request() -> SearchRequest {
         SearchRequest {
-            uid: "FIXTUREUID".to_owned(),
+            uid: "  FIXTUREUID  ".to_owned(),
             options: options(),
         }
     }
@@ -698,6 +760,8 @@ mod tests {
 
     #[test]
     fn query_validation_rejects_bad_dates_and_limits() {
+        assert!(RecordingSearchOptions::default().validate().is_ok());
+
         let mut value = options();
         value.end.day = 31;
         assert!(value.validate().is_err());
@@ -724,6 +788,84 @@ mod tests {
         assert_eq!(info.channel_id, Some(0));
         assert_eq!(info.stream_type.as_deref(), Some("subStream"));
         assert_eq!(info.start_time, Some(timestamp(0)));
+
+        let page = build_page_request(&request, 17);
+        assert_eq!(page.file_info[0].uid.as_deref(), Some("FIXTUREUID"));
+    }
+
+    #[test]
+    fn top_level_cursor_and_nested_completion_markers_are_supported() {
+        let open = FileInfoList {
+            handle: Some(23),
+            ..Default::default()
+        };
+        assert_eq!(find_handle(&open), Some(23));
+
+        let page = FileInfoList {
+            file_info: vec![FileInfo {
+                file_list: Some(FileResultList {
+                    b_finished: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(completion_marker(&page), Some(true));
+    }
+
+    #[test]
+    fn generic_success_get_is_empty_and_any_success_close_body_is_accepted() {
+        let generic = BcXml::try_parse(
+            include_bytes!("../bc/samples/file_info_list_generic_empty.xml").as_slice(),
+        )
+        .unwrap();
+        assert!(matches!(
+            classify_file_info_reply(
+                MSG_ID_FILE_INFO_LIST_GET,
+                200,
+                Some(BcPayloads::BcXml(generic))
+            ),
+            Ok(FileInfoCommandReply::Empty)
+        ));
+        assert!(matches!(
+            classify_file_info_reply(MSG_ID_FILE_INFO_LIST_GET, 200, None),
+            Ok(FileInfoCommandReply::Empty)
+        ));
+        assert!(matches!(
+            classify_file_info_reply(
+                MSG_ID_FILE_INFO_LIST_CLOSE,
+                200,
+                Some(BcPayloads::Binary(vec![1, 2, 3]))
+            ),
+            Ok(FileInfoCommandReply::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn recording_lock_serializes_cursor_operations() {
+        let lock = tokio::sync::Mutex::new(());
+        let active = AtomicUsize::new(0);
+        let overlapped = AtomicBool::new(false);
+
+        let first = with_recording_lock(&lock, async {
+            if active.fetch_add(1, Ordering::SeqCst) != 0 {
+                overlapped.store(true, Ordering::SeqCst);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            active.fetch_sub(1, Ordering::SeqCst);
+        });
+        let second = with_recording_lock(&lock, async {
+            if active.fetch_add(1, Ordering::SeqCst) != 0 {
+                overlapped.store(true, Ordering::SeqCst);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            active.fetch_sub(1, Ordering::SeqCst);
+        });
+
+        tokio::join!(first, second);
+        assert!(!overlapped.load(Ordering::SeqCst));
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
     #[test]
