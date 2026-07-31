@@ -78,6 +78,11 @@ technical references live in [`docs/`](docs/) ([index](docs/README.md)):
 Download from the
 [release page](https://github.com/privatecoder/neolink/releases)
 
+The core and no-default-feature workspace remain validated on Rust 1.88. The
+locked GStreamer 0.25 / GLib-GIO 0.22 dependency stack used by the default
+features and `recording-export` requires Rust 1.92 or newer and is validated on
+Rust 1.96.
+
 ## Config/Usage
 
 ### RTSP
@@ -747,6 +752,10 @@ neolink recordings --config=config.toml CameraName --date 2026-01-02 \
 
 # Machine-readable results, including camera-provided recording identifiers
 neolink recordings --config=config.toml CameraName --date 2026-01-02 --json
+
+# Narrow a busy camera's search to one inclusive camera-local time window
+neolink recordings --config=config.toml CameraName --date 2026-01-02 \
+  --from 08:00:00 --until 09:59:59 --json
 ```
 
 Queries use the camera's local calendar date and are deliberately bounded. Use
@@ -755,9 +764,97 @@ safety ceilings. The default text output reports only counts, pagination state,
 and the earliest/latest timestamps. JSON never includes the camera UID,
 credentials, or raw protocol XML. It includes the camera-provided identifiers
 and any name/path fields already present in the response; the command does not
-perform separate filename enrichment.
+perform separate filename enrichment. `--from` and `--until` are inclusive,
+must use exact `HH:MM:SS` values on the single `--date`, and default to
+`00:00:00` and `23:59:59`. The JSON envelope echoes those exact strings as
+top-level `from` and `until` fields so callers can bind and paginate narrowed
+windows without inferring them from returned clips.
 
-This command only lists metadata. It does not replay or download recordings.
+The metadata command itself only lists recordings. A single JSON entry from
+that output can be exported separately as a fragmented, streamable MP4:
+
+```bash
+# Video-only fragmented MP4. The RecordingEntry travels over stdin, never argv.
+jq -c '.entries[0]' recordings.json \
+  | neolink recording-export --config=config.toml CameraName \
+      --channel 1 --stream sub > recording.mp4
+
+# Require and include AAC. This fails before writing stdout when valid AAC is
+# not observed during bounded codec preflight.
+jq -c '.entries[0]' recordings.json \
+  | neolink recording-export --config=config.toml CameraName \
+      --audio required > recording-with-audio.mp4
+```
+
+`recording-export` accepts exactly one `RecordingEntry` JSON object from stdin,
+capped at 64 KiB. It uses a dedicated camera connection, starts output at the
+first H.264 keyframe, normalizes camera timestamp wrap/reset discontinuities,
+and remuxes without decoding, transcoding, or writing footage to disk. Standard
+output contains MP4 bytes only; controlled diagnostics go to standard error.
+The validated camera FPS is negotiated through `h264parse` and `mp4mux` instead
+of leaving the MP4 track to a 10,000 fps fallback. Camera-envelope timestamp
+normalization retains plausible jitter, dropped-frame gaps, and counter wrap.
+After `h264parse` establishes real access-unit boundaries, an in-place probe
+repairs missing, duplicate, implausibly tiny, reset, or backward timestamps by
+one nominal frame while preserving plausible sparse multi-frame gaps.
+Once replay/export begins, failures use one stable allowlisted line:
+`recording export failed: <category>`. Categories distinguish replay request,
+stream, STOP, limit, stall, disconnect, and cancellation outcomes; H.264/AAC
+parser and MP4 mux failures; output initialization, write, disconnect, and
+stall failures; finalization timeout; unsupported late H.265/invalid AAC; and
+camera-cleanup timeout/failure. Codec preflight retains its two-dimensional
+`recording codec preflight failed: <termination>:<content>` contract, while the
+exact `RECORDING_EXPORT_AUDIO_UNAVAILABLE:` prefix remains reserved for the
+documented zero-output AAC fallback. No category contains a camera UID,
+credential, recording identifier, path, codec debug string, or raw protocol
+error.
+The appsink hands fragments to a nonblocking stdout pump through a byte-accounted
+queue. The pump admits at most 256 samples total: one being written and 255
+queued. Each sample is capped at 16 MiB, while payload bytes across all
+in-flight plus queued samples are capped at 32 MiB; the exact application-owned
+budget is therefore 32 MiB of payload plus at most 256 fixed-size message/`Vec`
+headers. GStreamer's appsink is separately capped at one queued sample.
+GStreamer 1.22 does not provide an appsink byte-limit property, so that mapped
+upstream sample is honestly outside the 32 MiB pump payload budget; the
+one-second mux fragment and bounded upstream queues constrain it, and any sample
+over 16 MiB is rejected immediately after pull and before copying it into the
+pump. A full/oversized queue or two seconds without stdout write progress
+cancels replay and reports a consumer-stalled failure, so a connected reader
+that stops consuming cannot indefinitely delay STOP.
+
+For bursty stored playback, this command alone selects the core replay hard
+ceilings of 32 decoded packets and 64 MiB of decoded queued payload; list and
+live-stream defaults are unchanged. The core protocol layer's independently
+enforced logical payload ceilings total 352 MiB across connection ingress, raw
+replay, decoded replay, and their bounded in-flight packets. GStreamer then
+allows 16 MiB in each appsrc and 16 MiB in each downstream branch queue (32 MiB
+for video-only or 64 MiB for H.264+AAC), followed by the 32 MiB output-pump
+payload budget described above and one separately held appsink sample. These are
+conservative logical payload ceilings, not expected RSS: ref-counted buffers can
+share storage, while allocator, parser, muxer, message-header, and thread
+overhead are additional; GStreamer 1.22 cannot byte-cap that one appsink sample.
+
+The default `--audio none` creates a video-only file and intentionally ignores
+camera audio. `--audio required` fixes an H.264+AAC topology only after both a
+keyframe and valid ADTS AAC pass the bounded preflight. H.265 is not supported;
+ADPCM cannot be included. Replay duration and compressed-byte limits are
+configurable only within hard safety ceilings. A closed stdout cancels replay
+and triggers bounded camera STOP/connection cleanup.
+
+Some camera firmware sends recording bytes without the terminal replay status
+201. For compatibility, command-5 binary activity arms a bounded 15-second idle
+completion timer. Silence is accepted as a clean ending only after at least one
+complete media packet has decoded and the decoder has no partial packet. The
+timer resets on each later binary envelope; status/XML chatter does not reset
+it. Silence before any decoded media remains subject to the ordinary duration
+or transport-error bounds, while an idle partial packet is a static invalid-media
+failure. An explicit 201 always remains the preferred clean camera ending.
+
+When `--audio required` fails before stdout because AAC is missing, ADPCM-only,
+or invalid, stderr begins with the stable non-secret marker
+`RECORDING_EXPORT_AUDIO_UNAVAILABLE`. A caller may use only that marker to retry
+the same stdin entry with `--audio none`. Other failures are not retryable by
+that rule.
 
 ### Services (camera ports)
 

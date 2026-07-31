@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use env_logger::Env;
 use log::*;
-use std::fs;
+use std::{fs, process::ExitCode};
 use validator::Validate;
 
 mod battery;
@@ -46,6 +46,8 @@ mod mqtt;
 mod pir;
 mod ptz;
 mod reboot;
+#[cfg(feature = "gstreamer")]
+mod recording_export;
 mod recordings;
 #[cfg(feature = "gstreamer")]
 mod rtsp;
@@ -63,7 +65,30 @@ use config::Config;
 pub(crate) type AnyResult<T> = Result<T, anyhow::Error>;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
+    let opt = Opt::parse();
+
+    // Recording export writes an opaque binary stream to stdout. It also carries
+    // caller-selected recording identifiers and connects by a private camera UID.
+    // Dispatch it before installing the normal logger or starting NeoReactor so
+    // trace logging cannot disclose either value and no shared camera connection
+    // is created in this one-shot process.
+    #[cfg(feature = "gstreamer")]
+    if matches!(opt.cmd.as_ref(), Some(Command::RecordingExport(_))) {
+        let Some(Command::RecordingExport(export_opt)) = opt.cmd else {
+            unreachable!();
+        };
+        return Ok(recording_export::report_result(
+            recording_export::run_from_config(export_opt, opt.config).await,
+            std::io::stderr(),
+        ));
+    }
+
+    run_regular(opt).await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_regular(opt: Opt) -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info"))
         .target(env_logger::Target::Stderr)
         .init();
@@ -73,8 +98,6 @@ async fn main() -> Result<()> {
         env!("NEOLINK_VERSION"),
         env!("NEOLINK_PROFILE")
     );
-
-    let opt = Opt::parse();
 
     let conf_path = opt.config.context("Must supply --config file")?;
     let mut config: Config = toml::from_str(
@@ -131,6 +154,8 @@ async fn main() -> Result<()> {
         Some(Command::Recordings(opts)) => {
             recordings::main(opts, neo_reactor.clone()).await?;
         }
+        #[cfg(feature = "gstreamer")]
+        Some(Command::RecordingExport(_)) => unreachable!("recording export is dispatched early"),
         #[cfg(feature = "gstreamer")]
         Some(Command::Talk(opts)) => {
             talk::main(opts, neo_reactor.clone()).await?;

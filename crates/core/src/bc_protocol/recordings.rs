@@ -3,7 +3,7 @@ use crate::bc::{
     model::*,
     xml::{FileInfo, FileInfoList},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, future::Future, sync::Arc, time::Duration};
 
 pub use crate::bc::xml::FileDateTime;
@@ -153,7 +153,7 @@ pub enum RecordingSearchEnd {
 }
 
 /// One recording metadata entry.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordingEntry {
     /// Camera-provided stable identifier/path, when available.

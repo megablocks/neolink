@@ -17,6 +17,14 @@ pub struct Opt {
     #[arg(long)]
     pub date: String,
 
+    /// Camera-local inclusive lower time bound in exact HH:MM:SS format.
+    #[arg(long, default_value = "00:00:00")]
+    pub from: String,
+
+    /// Camera-local inclusive upper time bound in exact HH:MM:SS format.
+    #[arg(long, default_value = "23:59:59")]
+    pub until: String,
+
     /// Override the camera config's logical channel.
     #[arg(long)]
     pub channel: Option<u8>,
