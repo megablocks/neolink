@@ -141,6 +141,9 @@ pub struct BcXml {
     /// Read and write users
     #[serde(rename = "UserList", skip_serializing_if = "Option::is_none")]
     pub user_list: Option<UserList>,
+    /// FileInfoList recording metadata request/response
+    #[serde(rename = "FileInfoList", skip_serializing_if = "Option::is_none")]
+    pub file_info_list: Option<FileInfoList>,
 }
 
 impl BcXml {
@@ -173,6 +176,122 @@ impl Extension {
         writer.write_serializable("Extension", &self)?;
         Ok(w)
     }
+}
+
+/// FileInfoList request/response envelope used by recording search commands.
+#[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct FileInfoList {
+    /// XML schema version.
+    #[serde(rename = "@version", skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// FileInfo request or result entries.
+    #[serde(rename = "FileInfo", default, skip_serializing_if = "Vec::is_empty")]
+    pub file_info: Vec<FileInfo>,
+    /// Some firmware returns direct File entries.
+    #[serde(rename = "File", default, skip_serializing_if = "Vec::is_empty")]
+    pub file: Vec<FileInfo>,
+    /// Pagination completion marker.
+    #[serde(rename = "bFinished", skip_serializing_if = "Option::is_none")]
+    pub b_finished: Option<u8>,
+    /// Alternate pagination completion marker.
+    #[serde(rename = "finished", skip_serializing_if = "Option::is_none")]
+    pub finished: Option<u8>,
+}
+
+/// A FileInfoList search request, cursor response, or recording result.
+#[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct FileInfo {
+    /// Device UID used in requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+    /// Enable AI-track search.
+    #[serde(rename = "searchAITrack", skip_serializing_if = "Option::is_none")]
+    pub search_ai_track: Option<u8>,
+    /// Logical camera channel.
+    #[serde(rename = "channelId", skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u8>,
+    /// Logical channel bitmap.
+    #[serde(rename = "logicChnBitmap", skip_serializing_if = "Option::is_none")]
+    pub logic_chn_bitmap: Option<u32>,
+    /// Requested stream type.
+    #[serde(rename = "streamType", skip_serializing_if = "Option::is_none")]
+    pub stream_type: Option<String>,
+    /// Requested or returned recording class.
+    #[serde(rename = "recordType", skip_serializing_if = "Option::is_none")]
+    pub record_type: Option<String>,
+    /// Alternate returned recording class.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_: Option<String>,
+    /// Alternate returned alarm class.
+    #[serde(rename = "alarmType", skip_serializing_if = "Option::is_none")]
+    pub alarm_type: Option<String>,
+    /// Search/result start timestamp.
+    #[serde(rename = "startTime", skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<FileDateTime>,
+    /// Search/result end timestamp.
+    #[serde(rename = "endTime", skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<FileDateTime>,
+    /// Server-side search cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<u32>,
+    /// Recording identifier.
+    #[serde(rename = "Id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Recording name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Recording filename/path.
+    #[serde(rename = "fileName", skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    /// Recording size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Alternate recording size.
+    #[serde(rename = "fileSize", skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
+    /// Direct nested result entries.
+    #[serde(rename = "File", default, skip_serializing_if = "Vec::is_empty")]
+    pub file: Vec<FileInfo>,
+    /// Lowercase nested result-list wrapper.
+    #[serde(rename = "fileList", skip_serializing_if = "Option::is_none")]
+    pub file_list: Option<FileResultList>,
+    /// Uppercase nested result-list wrapper.
+    #[serde(rename = "FileList", skip_serializing_if = "Option::is_none")]
+    pub file_list_upper: Option<FileResultList>,
+    /// Pagination completion marker.
+    #[serde(rename = "bFinished", skip_serializing_if = "Option::is_none")]
+    pub b_finished: Option<u8>,
+    /// Alternate pagination completion marker.
+    #[serde(rename = "finished", skip_serializing_if = "Option::is_none")]
+    pub finished: Option<u8>,
+}
+
+/// A nested FileInfoList recording result list.
+#[derive(Clone, PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+pub struct FileResultList {
+    /// File result entries.
+    #[serde(rename = "File", default, skip_serializing_if = "Vec::is_empty")]
+    pub file: Vec<FileInfo>,
+    /// FileInfo result entries.
+    #[serde(rename = "FileInfo", default, skip_serializing_if = "Vec::is_empty")]
+    pub file_info: Vec<FileInfo>,
+}
+
+/// Camera-local date/time fields used by FileInfoList.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug, Deserialize, Serialize)]
+pub struct FileDateTime {
+    /// Year.
+    pub year: u16,
+    /// Month, 1-12.
+    pub month: u8,
+    /// Day, 1-31.
+    pub day: u8,
+    /// Hour, 0-23.
+    pub hour: u8,
+    /// Minute, 0-59.
+    pub minute: u8,
+    /// Second, 0-59.
+    pub second: u8,
 }
 
 /// Encryption xml
@@ -2114,4 +2233,48 @@ fn test_empty_floodlight_status_list() {
         } if version == "1.1" && floodlight_status_list.is_empty() => {}
         _ => panic!(),
     }
+}
+
+#[test]
+fn test_file_info_list_open_fixture() {
+    let parsed =
+        BcXml::try_parse(include_bytes!("samples/file_info_list_open.xml").as_slice()).unwrap();
+    let list = parsed.file_info_list.unwrap();
+    assert_eq!(list.version.as_deref(), Some("1.1"));
+    assert_eq!(list.file_info[0].handle, Some(17));
+}
+
+#[test]
+fn test_file_info_list_direct_fixture() {
+    let parsed =
+        BcXml::try_parse(include_bytes!("samples/file_info_list_page_direct.xml").as_slice())
+            .unwrap();
+    let list = parsed.file_info_list.unwrap();
+    assert_eq!(list.file_info.len(), 2);
+    assert_eq!(list.file_info[0].size, Some(1234));
+    assert_eq!(list.file_info[1].file_size, Some(5678));
+    assert_eq!(list.file_info[1].start_time.unwrap().hour, 2);
+    assert_eq!(list.b_finished, Some(1));
+}
+
+#[test]
+fn test_file_info_list_nested_fixture() {
+    let parsed =
+        BcXml::try_parse(include_bytes!("samples/file_info_list_page_nested.xml").as_slice())
+            .unwrap();
+    let list = parsed.file_info_list.unwrap();
+    let nested = list.file_info[0].file_list.as_ref().unwrap();
+    assert_eq!(nested.file.len(), 1);
+    assert_eq!(nested.file[0].type_.as_deref(), Some("md"));
+    assert_eq!(list.finished, Some(1));
+}
+
+#[test]
+fn test_file_info_list_empty_fixture() {
+    let parsed =
+        BcXml::try_parse(include_bytes!("samples/file_info_list_page_empty.xml").as_slice())
+            .unwrap();
+    let list = parsed.file_info_list.unwrap();
+    assert!(list.file.is_empty());
+    assert_eq!(list.file_info.len(), 1);
 }

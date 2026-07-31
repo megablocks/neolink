@@ -116,6 +116,7 @@ Implemented in `crates/core/src/bc/crypto.rs`.
 | 4 | VIDEO_STOP | 151 | ABILITY_INFO |
 | 10 | TALKABILITY | 201 | TALKCONFIG |
 | 11 | TALKRESET | 202 | TALK |
+| 14/15/16 | FILE_INFO_LIST OPEN / GET / CLOSE | | |
 | 18/19 | PTZ_CONTROL / _PRESET | 208/209 | GET/SET_LED_STATUS |
 | 23 | REBOOT | 212/213 | GET/START_PIR_ALARM |
 | 31/33 | MOTION_REQUEST / MOTION | 234 | UDP_KEEP_ALIVE |
@@ -126,6 +127,21 @@ Implemented in `crates/core/src/bc/crypto.rs`.
 | 104/105 | GET/SET_GENERAL | 438 | FLOODLIGHT_TASKS_READ |
 
 (See `model.rs` for the full list.)
+
+### `FILE_INFO_LIST` (14/15/16) — stored recording metadata
+
+Stored recording searches are a cursor flow:
+
+1. `OPEN` (14) submits one camera-local, same-day range and returns a handle.
+2. `GET` (15) returns paginated `FileInfo`/`File` metadata.
+3. `CLOSE` (16) releases the handle.
+
+The request keeps the logical channel inside the XML payload and uses host
+channel `250` in the BC header. A cursor is always closed after a successful
+OPEN, including when pagination fails or hits a configured page/entry ceiling.
+A header-only `400` reply to GET is treated as end-of-results; other non-200
+responses remain errors. Recording XML is redacted from parse-error logs because
+it can contain device UID and recording paths.
 
 ### `GET_ENC` (56) — live encoder config
 

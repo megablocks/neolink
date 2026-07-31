@@ -46,6 +46,7 @@ mod mqtt;
 mod pir;
 mod ptz;
 mod reboot;
+mod recordings;
 #[cfg(feature = "gstreamer")]
 mod rtsp;
 mod services;
@@ -124,6 +125,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Ptz(opts)) => {
             ptz::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Recordings(opts)) => {
+            recordings::main(opts, neo_reactor.clone()).await?;
         }
         #[cfg(feature = "gstreamer")]
         Some(Command::Talk(opts)) => {

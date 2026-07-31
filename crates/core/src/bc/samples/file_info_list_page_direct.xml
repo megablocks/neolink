@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<FileInfoList version="1.1">
+<FileInfo>
+<Id>/fixture/channel0/recording-a.mp4</Id>
+<name>recording-a.mp4</name>
+<recordType>people</recordType>
+<size>1234</size>
+<startTime><year>2026</year><month>7</month><day>30</day><hour>1</hour><minute>2</minute><second>3</second></startTime>
+<endTime><year>2026</year><month>7</month><day>30</day><hour>1</hour><minute>3</minute><second>4</second></endTime>
+<firmwareSpecificField>ignored</firmwareSpecificField>
+</FileInfo>
+<FileInfo>
+<fileName>/fixture/channel0/recording-b.mp4</fileName>
+<alarmType>vehicle</alarmType>
+<fileSize>5678</fileSize>
+<startTime><year>2026</year><month>7</month><day>30</day><hour>2</hour><minute>3</minute><second>4</second></startTime>
+<endTime><year>2026</year><month>7</month><day>30</day><hour>2</hour><minute>4</minute><second>5</second></endTime>
+</FileInfo>
+<bFinished>1</bFinished>
+</FileInfoList>
+</body>

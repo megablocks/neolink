@@ -20,6 +20,13 @@ type IResult<I, O, E = nom_language::error::VerboseError<I>> = Result<(I, O), no
 /// malicious lengths.
 const MAX_BODY_LEN: u32 = 16 * 1024 * 1024;
 
+fn is_file_info_list_message(msg_id: u32) -> bool {
+    matches!(
+        msg_id,
+        MSG_ID_FILE_INFO_LIST_OPEN | MSG_ID_FILE_INFO_LIST_GET | MSG_ID_FILE_INFO_LIST_CLOSE
+    )
+}
+
 impl Bc {
     /// Returns Ok(deserialized data, the amount of data consumed)
     /// Can then use this as the amount that should be remove from a buffer
@@ -217,19 +224,33 @@ fn bc_modern_msg<'a>(
             };
         } else {
             if context.debug {
-                println!(
-                    "Payload Txt: {:?}",
-                    String::from_utf8(processed_payload_buf.to_vec())
-                        .unwrap_or("Not Text".to_string())
-                );
+                if is_file_info_list_message(header.msg_id) {
+                    println!(
+                        "Payload Txt: <FileInfoList redacted, {} bytes>",
+                        processed_payload_buf.len()
+                    );
+                } else {
+                    println!(
+                        "Payload Txt: {:?}",
+                        String::from_utf8(processed_payload_buf.to_vec())
+                            .unwrap_or("Not Text".to_string())
+                    );
+                }
             }
             let xml = BcXml::try_parse(processed_payload_buf.as_slice()).map_err(|e| {
                 error!("header.msg_id: {}", header.msg_id);
-                error!(
-                    "processed_payload_buf: {:X?}::{:?}",
-                    processed_payload_buf,
-                    std::str::from_utf8(&processed_payload_buf)
-                );
+                if is_file_info_list_message(header.msg_id) {
+                    error!(
+                        "FileInfoList XML payload redacted ({} bytes)",
+                        processed_payload_buf.len()
+                    );
+                } else {
+                    error!(
+                        "processed_payload_buf: {:X?}::{:?}",
+                        processed_payload_buf,
+                        std::str::from_utf8(&processed_payload_buf)
+                    );
+                }
                 log::error!("e: {:?}", e);
                 Err::Error(make_error(
                     buf,
@@ -299,6 +320,14 @@ mod tests {
         let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))
             .is_test(true)
             .try_init();
+    }
+
+    #[test]
+    fn file_info_list_messages_are_classified_as_private() {
+        assert!(is_file_info_list_message(MSG_ID_FILE_INFO_LIST_OPEN));
+        assert!(is_file_info_list_message(MSG_ID_FILE_INFO_LIST_GET));
+        assert!(is_file_info_list_message(MSG_ID_FILE_INFO_LIST_CLOSE));
+        assert!(!is_file_info_list_message(MSG_ID_LOGIN));
     }
 
     #[test]

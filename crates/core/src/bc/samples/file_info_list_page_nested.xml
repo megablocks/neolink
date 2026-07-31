@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<FileInfoList version="1.1">
+<FileInfo>
+<fileList>
+<File>
+<Id>/fixture/channel1/recording-c.mp4</Id>
+<name>recording-c.mp4</name>
+<type>md</type>
+<startTime><year>2026</year><month>7</month><day>30</day><hour>3</hour><minute>4</minute><second>5</second></startTime>
+<endTime><year>2026</year><month>7</month><day>30</day><hour>3</hour><minute>5</minute><second>6</second></endTime>
+</File>
+</fileList>
+</FileInfo>
+<finished>1</finished>
+</FileInfoList>
+</body>

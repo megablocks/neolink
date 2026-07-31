@@ -22,6 +22,12 @@ pub const MSG_ID_VIDEO_STOP: u32 = 4;
 pub const MSG_ID_TALKABILITY: u32 = 10;
 /// TalkReset messages have this ID
 pub const MSG_ID_TALKRESET: u32 = 11;
+/// Open a FileInfoList recording metadata search
+pub const MSG_ID_FILE_INFO_LIST_OPEN: u32 = 14;
+/// Read one page from a FileInfoList recording metadata search
+pub const MSG_ID_FILE_INFO_LIST_GET: u32 = 15;
+/// Close a FileInfoList recording metadata search
+pub const MSG_ID_FILE_INFO_LIST_CLOSE: u32 = 16;
 /// PtzControl messages have this ID
 pub const MSG_ID_PTZ_CONTROL: u32 = 18;
 /// PTZ goto preset position

@@ -246,6 +246,23 @@ pub enum Error {
         feature: &'static str,
     },
 
+    /// A recording search succeeded, but its server-side cursor was not
+    /// acknowledged as closed.
+    #[error("Recording search cursor close failed")]
+    RecordingCloseFailed {
+        /// The close error, retained for programmatic inspection.
+        close: std::sync::Arc<Error>,
+    },
+
+    /// A recording search failed and its server-side cursor also failed to close.
+    #[error("Recording search failed and cursor close also failed")]
+    RecordingSearchAndCloseFailed {
+        /// The original search error.
+        search: std::sync::Arc<Error>,
+        /// The close error.
+        close: std::sync::Arc<Error>,
+    },
+
     /// Raised when a thread panics
     #[error("Thread panicked")]
     JoinError(#[from] std::sync::Arc<tokio::task::JoinError>),

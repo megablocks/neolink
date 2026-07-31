@@ -23,6 +23,7 @@ pub enum Command {
     Reboot(super::reboot::Opt),
     Pir(super::pir::Opt),
     Ptz(super::ptz::Opt),
+    Recordings(super::recordings::Opt),
     #[cfg(feature = "gstreamer")]
     Talk(super::talk::Opt),
     Mqtt(super::mqtt::Opt),

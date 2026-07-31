@@ -30,6 +30,7 @@ mod ping;
 mod pirstate;
 mod ptz;
 mod reboot;
+mod recordings;
 mod resolution;
 mod services;
 mod siren;
@@ -52,6 +53,11 @@ pub use login::MaxEncryption;
 pub use motion::{MotionData, MotionStatus};
 pub use pirstate::PirState;
 pub use ptz::Direction;
+pub use recordings::{
+    RecordingEntry, RecordingSearchEnd, RecordingSearchOptions, RecordingSearchResult,
+    RecordingStreamKind, DEFAULT_RECORDING_MAX_ENTRIES, DEFAULT_RECORDING_MAX_PAGES,
+    HARD_RECORDING_MAX_ENTRIES, HARD_RECORDING_MAX_PAGES,
+};
 pub use resolution::*;
 use std::sync::Arc;
 pub use stream::{StreamData, StreamKind};
