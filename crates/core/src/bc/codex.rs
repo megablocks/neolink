@@ -23,6 +23,14 @@ pub(crate) struct BcCodex {
     amount_skipped: usize,
 }
 
+/// One parsed BC envelope plus the exact validated body length from its wire
+/// header. The sidecar survives decoding so connection/replay queues can account
+/// XML and extension bodies without lossy re-serialization or estimation.
+pub(crate) struct DecodedBc {
+    pub(crate) message: Bc,
+    pub(crate) wire_body_len: u32,
+}
+
 impl BcCodex {
     pub(crate) fn new_with_debug(credentials: Credentials) -> Self {
         let mut context = BcContext::new(credentials);
@@ -83,7 +91,7 @@ impl Encoder<Bc> for BcCodex {
 }
 
 impl Decoder for BcCodex {
-    type Item = Bc;
+    type Item = DecodedBc;
     type Error = Error;
 
     fn decode_eof(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>> {
@@ -113,9 +121,9 @@ impl Decoder for BcCodex {
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
         // trace!("Decoding: {:X?}", src);
-        let bc = loop {
-            match Bc::deserialize(&self.context, src) {
-                Ok(bc) => {
+        let decoded = loop {
+            match Bc::deserialize_with_wire_body_len(&self.context, src) {
+                Ok((message, wire_body_len)) => {
                     if self.amount_skipped > 0 {
                         log::debug!(
                             "BC stream resynced after skipping {} byte(s)",
@@ -123,7 +131,10 @@ impl Decoder for BcCodex {
                         );
                         self.amount_skipped = 0;
                     }
-                    break bc;
+                    break DecodedBc {
+                        message,
+                        wire_body_len,
+                    };
                 }
                 Err(Error::NomIncomplete(_)) => return Ok(None),
                 Err(e) => {
@@ -185,7 +196,7 @@ impl Decoder for BcCodex {
                         })),
                     ..
                 }),
-        } = &bc
+        } = &decoded.message
         {
             if response_code >> 8 == 0xdd {
                 // Login reply has the encryption info
@@ -214,16 +225,16 @@ impl Decoder for BcCodex {
                     ..
                 }),
             ..
-        }) = bc.body
+        }) = &decoded.message.body
         {
-            if on_off == 0 {
-                self.context.binary_off(bc.meta.msg_num);
+            if *on_off == 0 {
+                self.context.binary_off(decoded.message.meta.msg_num);
             } else {
-                self.context.binary_on(bc.meta.msg_num);
+                self.context.binary_on(decoded.message.meta.msg_num);
             }
         }
 
-        Ok(Some(bc))
+        Ok(Some(decoded))
     }
 }
 

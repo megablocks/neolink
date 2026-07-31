@@ -3,20 +3,40 @@ use crate::bcmedia::codex::BcMediaCodex;
 use crate::{bc::model::*, bcmedia::model::*, Error, Result};
 use futures::stream::{Stream, TryStreamExt};
 use std::io::{Error as IoError, Result as IoResult};
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::{mpsc::Receiver, OwnedSemaphorePermit};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tokio_util::codec::FramedRead;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
+pub(crate) struct BcSubscriptionItem {
+    result: Option<Result<Bc>>,
+    _reservation: Option<OwnedSemaphorePermit>,
+}
+
+impl BcSubscriptionItem {
+    pub(crate) fn new(result: Result<Bc>, reservation: Option<OwnedSemaphorePermit>) -> Self {
+        Self {
+            result: Some(result),
+            _reservation: reservation,
+        }
+    }
+
+    pub(super) fn into_result(mut self) -> Result<Bc> {
+        self.result
+            .take()
+            .expect("subscription item is consumed exactly once")
+    }
+}
+
 pub struct BcSubscription<'a> {
-    rx: ReceiverStream<Result<Bc>>,
+    rx: ReceiverStream<BcSubscriptionItem>,
     msg_num: Option<u32>,
     conn: &'a BcConnection,
 }
 
 impl<'a> BcSubscription<'a> {
     pub fn new(
-        rx: Receiver<Result<Bc>>,
+        rx: Receiver<BcSubscriptionItem>,
         msg_num: Option<u32>,
         conn: &'a BcConnection,
     ) -> BcSubscription<'a> {
@@ -38,7 +58,12 @@ impl<'a> BcSubscription<'a> {
     }
 
     pub async fn recv(&mut self) -> Result<Bc> {
-        let bc = self.rx.next().await.ok_or(Error::DroppedSubscriber)?;
+        let bc = self
+            .rx
+            .next()
+            .await
+            .ok_or(Error::DroppedSubscriber)?
+            .into_result();
         if let Ok(bc) = &bc {
             if let Some(msg_num) = self.msg_num {
                 assert!(bc.meta.msg_num as u32 == msg_num);
@@ -51,7 +76,7 @@ impl<'a> BcSubscription<'a> {
     }
 
     pub fn payload_stream(&'_ mut self) -> impl Stream<Item = IoResult<Vec<u8>>> + '_ {
-        (&mut self.rx).filter_map(|x| match x {
+        (&mut self.rx).filter_map(|x| match x.into_result() {
             Ok(Bc {
                 meta: BcMeta { .. },
                 body:

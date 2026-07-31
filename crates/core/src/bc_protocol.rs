@@ -30,6 +30,7 @@ mod ping;
 mod pirstate;
 mod ptz;
 mod reboot;
+mod recording_replay;
 mod recordings;
 mod resolution;
 mod services;
@@ -53,6 +54,13 @@ pub use login::MaxEncryption;
 pub use motion::{MotionData, MotionStatus};
 pub use pirstate::PirState;
 pub use ptz::Direction;
+pub use recording_replay::{
+    recording_replay_stop_token, RecordingReplay, RecordingReplayEnd, RecordingReplayOptions,
+    DEFAULT_RECORDING_REPLAY_BUFFER_SIZE, DEFAULT_RECORDING_REPLAY_MAX_BUFFERED_MEDIA_BYTES,
+    DEFAULT_RECORDING_REPLAY_MAX_BYTES, DEFAULT_RECORDING_REPLAY_MAX_DURATION,
+    HARD_RECORDING_REPLAY_MAX_BUFFERED_MEDIA_BYTES, HARD_RECORDING_REPLAY_MAX_BYTES,
+    HARD_RECORDING_REPLAY_MAX_DURATION, RECORDING_REPLAY_MAX_DECODED_PACKET_BYTES,
+};
 pub use recordings::{
     FileDateTime, RecordingEntry, RecordingSearchEnd, RecordingSearchOptions,
     RecordingSearchResult, RecordingStreamKind, DEFAULT_RECORDING_MAX_ENTRIES,
@@ -100,6 +108,8 @@ pub struct BcCamera {
     unsupported: RwLock<HashSet<String>>,
     /// Serializes FileInfoList cursors, which are stateful on the camera.
     recording_search_lock: Mutex<()>,
+    /// Serializes stored-recording replay sessions on this camera connection.
+    recording_replay_lock: Arc<Mutex<()>>,
 }
 
 /// Options used to construct a camera
@@ -411,6 +421,7 @@ impl BcCamera {
             abilities: Default::default(),
             unsupported: Default::default(),
             recording_search_lock: Default::default(),
+            recording_replay_lock: Default::default(),
         };
         me.keepalive().await?;
         Ok(me)

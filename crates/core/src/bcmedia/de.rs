@@ -15,7 +15,7 @@ const PAD_SIZE: u32 = 8;
 /// transports. 16 MiB is far above any real frame — a 4K key-frame is a few MiB at
 /// most, and the `additional_header` is only a handful of bytes — while still
 /// rejecting clearly malicious lengths.
-const MAX_MEDIA_PAYLOAD: u32 = 16 * 1024 * 1024;
+pub(crate) const MAX_MEDIA_PAYLOAD: u32 = 16 * 1024 * 1024;
 
 impl BcMedia {
     pub(crate) fn deserialize(buf: &mut BytesMut) -> Result<BcMedia, Error> {

@@ -15,8 +15,8 @@ mod tcpsource;
 mod udpsource;
 
 pub(crate) use self::{
-    bcconn::BcConnection, bcconn::*, bcsub::BcSubscription, discovery::Discovery,
-    tcpsource::TcpSource, udpsource::UdpSource,
+    bcconn::BcConnection, bcconn::*, bcsub::BcSubscription, bcsub::BcSubscriptionItem,
+    discovery::Discovery, tcpsource::TcpSource, udpsource::UdpSource,
 };
 // Publicly re-exported (via bc_protocol) so the binary can show the effective
 // default in its connection-config log.
