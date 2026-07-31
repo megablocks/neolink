@@ -92,6 +92,11 @@ impl RecordingSearchOptions {
         if self.record_types.trim().is_empty() {
             return Err(Error::Other("Recording search types must not be empty"));
         }
+        if self.channel > 31 {
+            return Err(Error::Other(
+                "Recording search channel must be between 0 and 31",
+            ));
+        }
         if !(1..=HARD_RECORDING_MAX_PAGES).contains(&self.max_pages) {
             return Err(Error::Other(
                 "Recording search max_pages is outside its safety ceiling",
@@ -161,9 +166,9 @@ impl RecordingEntry {
             name: value.name.clone(),
             file_name: value.file_name.clone(),
             record_type: value
-                .record_type
+                .type_
                 .clone()
-                .or_else(|| value.type_.clone())
+                .or_else(|| value.record_type.clone())
                 .or_else(|| value.alarm_type.clone()),
             size_bytes: value.size.or(value.file_size),
             start: value.start_time,
@@ -245,21 +250,22 @@ impl BcCamera {
     /// List stored recording metadata without downloading recording content.
     ///
     /// FileInfoList searches are scoped to one camera-local calendar day.
-    /// The server-side cursor is always closed after a successful OPEN, including
-    /// when pagination fails or reaches a configured safety ceiling.
+    /// After a successful OPEN, a best-effort CLOSE is attempted on every
+    /// completed code path, including pagination errors and configured safety
+    /// ceilings. Cancelling the future can interrupt that cleanup.
+    ///
+    /// The device UID is resolved through [`Self::uid`]; callers select the
+    /// logical device channel through [`RecordingSearchOptions::channel`].
     pub async fn search_recordings(
         &self,
-        uid: &str,
         options: RecordingSearchOptions,
     ) -> Result<RecordingSearchResult> {
         options.validate()?;
+        let uid = self.uid().await?;
         if uid.trim().is_empty() {
-            return Err(Error::Other("Recording search requires a camera UID"));
+            return Err(Error::Other("Camera returned an empty UID"));
         }
-        let request = SearchRequest {
-            uid: uid.to_owned(),
-            options,
-        };
+        let request = SearchRequest { uid, options };
         execute_search(request, |msg_id, payload| {
             self.send_file_info_list(msg_id, payload)
         })
@@ -402,7 +408,7 @@ where
             FileInfoCommandReply::Xml(list) => list,
         };
 
-        let finished = is_finished(&list);
+        let completion = completion_marker(&list);
         let mut page_entries = Vec::new();
         collect_entries(&list, &mut page_entries);
         let raw_page_len = page_entries.len();
@@ -421,14 +427,14 @@ where
             }
         }
 
-        if finished {
+        if completion == Some(true) {
             return Ok(RecordingSearchResult {
                 entries,
                 pages,
                 end: RecordingSearchEnd::Finished,
             });
         }
-        if raw_page_len < TYPICAL_PAGE_SIZE {
+        if completion.is_none() && raw_page_len < TYPICAL_PAGE_SIZE {
             return Ok(RecordingSearchResult {
                 entries,
                 pages,
@@ -532,21 +538,39 @@ fn collect_entry(value: &FileInfo, entries: &mut Vec<RecordingEntry>) {
     }
 }
 
-fn is_finished(list: &FileInfoList) -> bool {
-    list.b_finished == Some(1)
-        || list.finished == Some(1)
-        || list.file_info.iter().any(is_entry_finished)
+fn completion_marker(list: &FileInfoList) -> Option<bool> {
+    let mut state = None;
+    merge_completion_marker(&mut state, list.b_finished);
+    merge_completion_marker(&mut state, list.finished);
+    for entry in list.file_info.iter().chain(list.file.iter()) {
+        merge_entry_completion_marker(&mut state, entry);
+    }
+    state
 }
 
-fn is_entry_finished(entry: &FileInfo) -> bool {
-    entry.b_finished == Some(1)
-        || entry.finished == Some(1)
-        || entry.file.iter().any(is_entry_finished)
-        || [entry.file_list.as_ref(), entry.file_list_upper.as_ref()]
-            .into_iter()
-            .flatten()
-            .flat_map(|list| list.file.iter().chain(list.file_info.iter()))
-            .any(is_entry_finished)
+fn merge_entry_completion_marker(state: &mut Option<bool>, entry: &FileInfo) {
+    merge_completion_marker(state, entry.b_finished);
+    merge_completion_marker(state, entry.finished);
+    for child in &entry.file {
+        merge_entry_completion_marker(state, child);
+    }
+    for list in [entry.file_list.as_ref(), entry.file_list_upper.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        for child in list.file.iter().chain(list.file_info.iter()) {
+            merge_entry_completion_marker(state, child);
+        }
+    }
+}
+
+fn merge_completion_marker(state: &mut Option<bool>, marker: Option<u8>) {
+    if let Some(marker) = marker {
+        let finished = marker == 1;
+        if finished || state.is_none() {
+            *state = Some(finished);
+        }
+    }
 }
 
 fn valid_datetime(value: FileDateTime) -> bool {
@@ -577,8 +601,8 @@ mod tests {
     fn timestamp(hour: u8) -> FileDateTime {
         FileDateTime {
             year: 2026,
-            month: 7,
-            day: 30,
+            month: 1,
+            day: 2,
             hour,
             minute: 0,
             second: 0,
@@ -620,7 +644,11 @@ mod tests {
         })
     }
 
-    fn page(first: usize, count: usize, finished: bool) -> FileInfoCommandReply {
+    fn page_with_marker(
+        first: usize,
+        count: usize,
+        completion_marker: Option<u8>,
+    ) -> FileInfoCommandReply {
         FileInfoCommandReply::Xml(FileInfoList {
             version: Some("1.1".to_owned()),
             file_info: (first..first + count)
@@ -635,9 +663,13 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
-            b_finished: finished.then_some(1),
+            b_finished: completion_marker,
             ..Default::default()
         })
+    }
+
+    fn page(first: usize, count: usize, finished: bool) -> FileInfoCommandReply {
+        page_with_marker(first, count, finished.then_some(1))
     }
 
     async fn run_mock(
@@ -677,6 +709,10 @@ mod tests {
         let mut value = options();
         value.max_entries = 0;
         assert!(value.validate().is_err());
+
+        let mut value = options();
+        value.channel = 32;
+        assert!(value.validate().is_err());
     }
 
     #[test]
@@ -688,6 +724,28 @@ mod tests {
         assert_eq!(info.channel_id, Some(0));
         assert_eq!(info.stream_type.as_deref(), Some("subStream"));
         assert_eq!(info.start_time, Some(timestamp(0)));
+    }
+
+    #[test]
+    fn recording_type_prefers_type_then_record_type_then_alarm_type() {
+        let entry = RecordingEntry::from_file_info(&FileInfo {
+            type_: Some("sched".to_owned()),
+            record_type: Some("people".to_owned()),
+            alarm_type: Some("vehicle".to_owned()),
+            id: Some("/fixture/preference.mp4".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(entry.record_type.as_deref(), Some("sched"));
+
+        let entry = RecordingEntry::from_file_info(&FileInfo {
+            record_type: Some("people".to_owned()),
+            alarm_type: Some("vehicle".to_owned()),
+            id: Some("/fixture/fallback.mp4".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(entry.record_type.as_deref(), Some("people"));
     }
 
     #[tokio::test]
@@ -750,6 +808,25 @@ mod tests {
         assert_eq!(result.entries.len(), TYPICAL_PAGE_SIZE);
         assert_eq!(result.pages, 2);
         assert_eq!(result.end, RecordingSearchEnd::EndOfResults);
+        assert_eq!(calls.last(), Some(&MSG_ID_FILE_INFO_LIST_CLOSE));
+    }
+
+    #[tokio::test]
+    async fn explicit_unfinished_short_page_continues_until_finished_marker() {
+        let (result, calls) = run_mock(
+            request(),
+            vec![
+                Ok(open_reply()),
+                Ok(page_with_marker(0, 1, Some(0))),
+                Ok(page_with_marker(1, 1, Some(1))),
+                Ok(FileInfoCommandReply::Empty),
+            ],
+        )
+        .await;
+        let result = result.unwrap();
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(result.pages, 2);
+        assert_eq!(result.end, RecordingSearchEnd::Finished);
         assert_eq!(calls.last(), Some(&MSG_ID_FILE_INFO_LIST_CLOSE));
     }
 
@@ -818,7 +895,10 @@ mod tests {
             ],
         )
         .await;
-        assert!(matches!(result, Err(Error::RecordingCloseFailed { .. })));
+        let error = result.unwrap_err();
+        assert!(matches!(&error, Error::RecordingCloseFailed { .. }));
+        assert!(error.to_string().contains("fixture CLOSE error"));
+        assert!(std::error::Error::source(&error).is_some());
         assert_eq!(calls.last(), Some(&MSG_ID_FILE_INFO_LIST_CLOSE));
     }
 
@@ -833,10 +913,18 @@ mod tests {
             ],
         )
         .await;
+        let error = result.unwrap_err();
         assert!(matches!(
-            result,
-            Err(Error::RecordingSearchAndCloseFailed { .. })
+            &error,
+            Error::RecordingSearchAndCloseFailed { .. }
         ));
+        let display = error.to_string();
+        assert!(display.contains("fixture GET error"));
+        assert!(display.contains("fixture CLOSE error"));
+        assert!(std::error::Error::source(&error)
+            .unwrap()
+            .to_string()
+            .contains("fixture GET error"));
         assert_eq!(calls.last(), Some(&MSG_ID_FILE_INFO_LIST_CLOSE));
     }
 }

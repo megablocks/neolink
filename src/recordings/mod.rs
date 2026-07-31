@@ -16,9 +16,6 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
     let (year, month, day) = parse_date(&opt.date)?;
     let camera = reactor.get(&opt.camera).await?;
     let camera_config = camera.config().await?.borrow().clone();
-    let uid = camera_config
-        .camera_uid
-        .context("Recording search requires a camera UID")?;
     let channel = opt.channel.unwrap_or(camera_config.channel_id);
     if channel > 31 {
         bail!("Recording channel must be between 0 and 31");
@@ -53,9 +50,8 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
 
     let result = camera
         .run_task(|cam| {
-            let uid = uid.clone();
             let options = options.clone();
-            Box::pin(async move { Ok(cam.search_recordings(&uid, options).await?) })
+            Box::pin(async move { Ok(cam.search_recordings(options).await?) })
         })
         .await
         .context("Unable to list recording metadata")?;

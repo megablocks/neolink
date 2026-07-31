@@ -28,6 +28,15 @@ pub const MSG_ID_FILE_INFO_LIST_OPEN: u32 = 14;
 pub const MSG_ID_FILE_INFO_LIST_GET: u32 = 15;
 /// Close a FileInfoList recording metadata search
 pub const MSG_ID_FILE_INFO_LIST_CLOSE: u32 = 16;
+
+/// Whether a message ID belongs to the privacy-sensitive FileInfoList flow.
+pub(crate) fn is_file_info_list_message(msg_id: u32) -> bool {
+    matches!(
+        msg_id,
+        MSG_ID_FILE_INFO_LIST_OPEN | MSG_ID_FILE_INFO_LIST_GET | MSG_ID_FILE_INFO_LIST_CLOSE
+    )
+}
+
 /// PtzControl messages have this ID
 pub const MSG_ID_PTZ_CONTROL: u32 = 18;
 /// PTZ goto preset position

@@ -237,6 +237,32 @@ struct Poller {
     dropped_full: u64,
 }
 
+struct TraceResponse<'a>(&'a Bc);
+
+impl std::fmt::Debug for TraceResponse<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if contains_file_info_list(self.0) {
+            formatter.write_str("<FileInfoList response redacted>")
+        } else {
+            std::fmt::Debug::fmt(self.0, formatter)
+        }
+    }
+}
+
+fn contains_file_info_list(response: &Bc) -> bool {
+    is_file_info_list_message(response.meta.msg_id)
+        || matches!(
+            &response.body,
+            BcBody::ModernMsg(ModernMsg {
+                payload: Some(BcPayloads::BcXml(BcXml {
+                    file_info_list: Some(_),
+                    ..
+                })),
+                ..
+            })
+        )
+}
+
 impl Poller {
     async fn run(&mut self) -> Result<()> {
         let cancel = CancellationToken::new();
@@ -378,7 +404,7 @@ impl Poller {
                                             msg_id,
                                             msg_num
                                         );
-                                        trace!("Contents: {:?}", response);
+                                        trace!("Contents: {:?}", TraceResponse(&response));
                                     }
                                 }
                                 (None, None) => {
@@ -387,7 +413,7 @@ impl Poller {
                                         msg_id,
                                         msg_num
                                     );
-                                    trace!("Contents: {:?}", response);
+                                    trace!("Contents: {:?}", TraceResponse(&response));
                                 }
                             }
                         }
@@ -451,7 +477,10 @@ impl Poller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bc::model::{Bc, BcBody, BcMeta, ModernMsg};
+    use crate::bc::{
+        model::{Bc, BcBody, BcMeta, BcPayloads, ModernMsg},
+        xml::{BcXml, FileInfo, FileInfoList},
+    };
     use tokio::time::{timeout, Duration};
 
     fn make_bc(msg_id: u32, msg_num: u16) -> Bc {
@@ -466,6 +495,52 @@ mod tests {
             },
             body: BcBody::ModernMsg(ModernMsg::default()),
         }
+    }
+
+    #[test]
+    fn unmatched_recording_responses_are_redacted() {
+        let response = Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_FILE_INFO_LIST_GET,
+                ..make_bc(0, 0).meta
+            },
+            body: BcBody::ModernMsg(ModernMsg {
+                extension: None,
+                payload: Some(BcPayloads::BcXml(BcXml {
+                    file_info_list: Some(FileInfoList {
+                        file_info: vec![FileInfo {
+                            id: Some("/fixture/private-recording-id".to_owned()),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+            }),
+        };
+        let output = format!("{:?}", TraceResponse(&response));
+
+        assert_eq!(output, "<FileInfoList response redacted>");
+        assert!(!output.contains("private-recording-id"));
+    }
+
+    #[test]
+    fn typed_recording_payload_is_redacted_even_with_an_unknown_message_id() {
+        let response = Bc {
+            meta: make_bc(999, 0).meta,
+            body: BcBody::ModernMsg(ModernMsg {
+                extension: None,
+                payload: Some(BcPayloads::BcXml(BcXml {
+                    file_info_list: Some(FileInfoList::default()),
+                    ..Default::default()
+                })),
+            }),
+        };
+
+        assert_eq!(
+            format!("{:?}", TraceResponse(&response)),
+            "<FileInfoList response redacted>"
+        );
     }
 
     /// Regression test for the keepalive-starvation bug (upstream #399): a

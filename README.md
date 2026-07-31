@@ -734,27 +734,28 @@ With 1.0 being normal and 2.5 being 2.5x zoom
 
 ### Stored recording metadata
 
-You can list recording metadata from a camera's SD card or an NVR channel without
-downloading footage:
+You can list recording metadata reported by a camera for one logical channel
+without downloading footage:
 
 ```bash
 # Privacy-conscious summary only (no filenames or recording paths)
-neolink recordings --config=config.toml CameraName --date 2026-07-30
+neolink recordings --config=config.toml CameraName --date 2026-01-02
 
 # Override the configured logical channel and request the main recording stream
-neolink recordings --config=config.toml CameraName --date 2026-07-30 \
+neolink recordings --config=config.toml CameraName --date 2026-01-02 \
   --channel 1 --stream main
 
 # Machine-readable results, including camera-provided recording identifiers
-neolink recordings --config=config.toml CameraName --date 2026-07-30 --json
+neolink recordings --config=config.toml CameraName --date 2026-01-02 --json
 ```
 
 Queries use the camera's local calendar date and are deliberately bounded. Use
 `--max-pages` and `--max-entries` to lower the defaults; both also have hard
 safety ceilings. The default text output reports only counts, pagination state,
 and the earliest/latest timestamps. JSON never includes the camera UID,
-credentials, or raw protocol XML, but it does include recording names/paths
-needed by later playback integrations.
+credentials, or raw protocol XML. It includes the camera-provided identifiers
+and any name/path fields already present in the response; the command does not
+perform separate filename enrichment.
 
 This command only lists metadata. It does not replay or download recordings.
 

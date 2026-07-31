@@ -248,16 +248,18 @@ pub enum Error {
 
     /// A recording search succeeded, but its server-side cursor was not
     /// acknowledged as closed.
-    #[error("Recording search cursor close failed")]
+    #[error("Recording search cursor close failed: {close}")]
     RecordingCloseFailed {
         /// The close error, retained for programmatic inspection.
+        #[source]
         close: std::sync::Arc<Error>,
     },
 
     /// A recording search failed and its server-side cursor also failed to close.
-    #[error("Recording search failed and cursor close also failed")]
+    #[error("Recording search failed: {search}; cursor close also failed: {close}")]
     RecordingSearchAndCloseFailed {
         /// The original search error.
+        #[source]
         search: std::sync::Arc<Error>,
         /// The close error.
         close: std::sync::Arc<Error>,

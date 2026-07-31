@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<FileInfoList version="1.1">
+<FileInfo>
+<ID>/fixture/channel0/uppercase-id.mp4</ID>
+<startTime>2026-01-02 03:04:05</startTime>
+<endTime>20260102030406</endTime>
+</FileInfo>
+<FileInfo>
+<id>/fixture/channel0/lowercase-id.mp4</id>
+<startTime>2026/01/02T04:05:06</startTime>
+<endTime><year>2026</year><month>1</month><day>2</day><hour>4</hour><minute>5</minute><second>7</second></endTime>
+</FileInfo>
+</FileInfoList>
+</body>

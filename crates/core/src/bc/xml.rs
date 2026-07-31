@@ -1,7 +1,10 @@
 #![allow(non_snake_case)]
 
-use serde::{Deserialize, Serialize};
-use std::{io::BufRead, io::Write};
+use serde::{
+    de::{self, IgnoredAny, MapAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
+use std::{fmt, io::BufRead, io::Write};
 
 #[cfg(test)]
 use indoc::indoc;
@@ -235,7 +238,12 @@ pub struct FileInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handle: Option<u32>,
     /// Recording identifier.
-    #[serde(rename = "Id", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Id",
+        alias = "ID",
+        alias = "id",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub id: Option<String>,
     /// Recording name.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -278,7 +286,7 @@ pub struct FileResultList {
 }
 
 /// Camera-local date/time fields used by FileInfoList.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug, Serialize)]
 pub struct FileDateTime {
     /// Year.
     pub year: u16,
@@ -292,6 +300,140 @@ pub struct FileDateTime {
     pub minute: u8,
     /// Second, 0-59.
     pub second: u8,
+}
+
+impl FileDateTime {
+    fn from_text(value: &str) -> Result<Self, &'static str> {
+        let digits = value
+            .chars()
+            .filter(|character| character.is_ascii_digit())
+            .collect::<String>();
+        if digits.len() != 14 {
+            return Err("expected a 14-digit YYYYMMDDhhmmss timestamp");
+        }
+        let parse = |range: std::ops::Range<usize>| {
+            digits
+                .get(range)
+                .ok_or("invalid timestamp boundaries")?
+                .parse()
+                .map_err(|_| "timestamp component was not numeric")
+        };
+        Ok(Self {
+            year: parse(0..4)?,
+            month: parse(4..6)?
+                .try_into()
+                .map_err(|_| "month did not fit in an unsigned byte")?,
+            day: parse(6..8)?
+                .try_into()
+                .map_err(|_| "day did not fit in an unsigned byte")?,
+            hour: parse(8..10)?
+                .try_into()
+                .map_err(|_| "hour did not fit in an unsigned byte")?,
+            minute: parse(10..12)?
+                .try_into()
+                .map_err(|_| "minute did not fit in an unsigned byte")?,
+            second: parse(12..14)?
+                .try_into()
+                .map_err(|_| "second did not fit in an unsigned byte")?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for FileDateTime {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FileDateTimeVisitor;
+
+        impl<'de> Visitor<'de> for FileDateTimeVisitor {
+            type Value = FileDateTime;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .write_str("structured date/time fields or a YYYYMMDDhhmmss-style timestamp")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                FileDateTime::from_text(value).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_str(&value)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut year = None;
+                let mut month = None;
+                let mut day = None;
+                let mut hour = None;
+                let mut minute = None;
+                let mut second = None;
+                let mut text: Option<String> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "year" => set_once(&mut year, map.next_value()?, "year")?,
+                        "month" => set_once(&mut month, map.next_value()?, "month")?,
+                        "day" => set_once(&mut day, map.next_value()?, "day")?,
+                        "hour" => set_once(&mut hour, map.next_value()?, "hour")?,
+                        "minute" => set_once(&mut minute, map.next_value()?, "minute")?,
+                        "second" => set_once(&mut second, map.next_value()?, "second")?,
+                        "$text" => set_once(&mut text, map.next_value()?, "$text")?,
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                if let Some(text) = text {
+                    if year.is_some()
+                        || month.is_some()
+                        || day.is_some()
+                        || hour.is_some()
+                        || minute.is_some()
+                        || second.is_some()
+                    {
+                        return Err(de::Error::custom(
+                            "date/time cannot mix text and structured fields",
+                        ));
+                    }
+                    return FileDateTime::from_text(&text).map_err(de::Error::custom);
+                }
+
+                Ok(FileDateTime {
+                    year: year.ok_or_else(|| de::Error::missing_field("year"))?,
+                    month: month.ok_or_else(|| de::Error::missing_field("month"))?,
+                    day: day.ok_or_else(|| de::Error::missing_field("day"))?,
+                    hour: hour.ok_or_else(|| de::Error::missing_field("hour"))?,
+                    minute: minute.ok_or_else(|| de::Error::missing_field("minute"))?,
+                    second: second.ok_or_else(|| de::Error::missing_field("second"))?,
+                })
+            }
+        }
+
+        fn set_once<T, E>(slot: &mut Option<T>, value: T, field: &'static str) -> Result<(), E>
+        where
+            E: de::Error,
+        {
+            if slot.replace(value).is_some() {
+                Err(E::duplicate_field(field))
+            } else {
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_any(FileDateTimeVisitor)
+    }
 }
 
 /// Encryption xml
@@ -2252,9 +2394,43 @@ fn test_file_info_list_direct_fixture() {
     let list = parsed.file_info_list.unwrap();
     assert_eq!(list.file_info.len(), 2);
     assert_eq!(list.file_info[0].size, Some(1234));
+    assert_eq!(list.file_info[0].type_.as_deref(), Some("sched"));
+    assert_eq!(list.file_info[0].record_type.as_deref(), Some("people"));
+    assert_eq!(list.file_info[0].alarm_type.as_deref(), Some("vehicle"));
     assert_eq!(list.file_info[1].file_size, Some(5678));
     assert_eq!(list.file_info[1].start_time.unwrap().hour, 2);
     assert_eq!(list.b_finished, Some(1));
+}
+
+#[test]
+fn test_file_info_list_identifier_aliases_and_text_datetimes() {
+    let parsed =
+        BcXml::try_parse(include_bytes!("samples/file_info_list_alias_datetime.xml").as_slice())
+            .unwrap();
+    let list = parsed.file_info_list.unwrap();
+
+    assert_eq!(
+        list.file_info[0].id.as_deref(),
+        Some("/fixture/channel0/uppercase-id.mp4")
+    );
+    assert_eq!(
+        list.file_info[0].start_time,
+        Some(FileDateTime {
+            year: 2026,
+            month: 1,
+            day: 2,
+            hour: 3,
+            minute: 4,
+            second: 5,
+        })
+    );
+    assert_eq!(list.file_info[0].end_time.unwrap().second, 6);
+    assert_eq!(
+        list.file_info[1].id.as_deref(),
+        Some("/fixture/channel0/lowercase-id.mp4")
+    );
+    assert_eq!(list.file_info[1].start_time.unwrap().hour, 4);
+    assert_eq!(list.file_info[1].end_time.unwrap().second, 7);
 }
 
 #[test]

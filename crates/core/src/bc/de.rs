@@ -20,13 +20,6 @@ type IResult<I, O, E = nom_language::error::VerboseError<I>> = Result<(I, O), no
 /// malicious lengths.
 const MAX_BODY_LEN: u32 = 16 * 1024 * 1024;
 
-fn is_file_info_list_message(msg_id: u32) -> bool {
-    matches!(
-        msg_id,
-        MSG_ID_FILE_INFO_LIST_OPEN | MSG_ID_FILE_INFO_LIST_GET | MSG_ID_FILE_INFO_LIST_CLOSE
-    )
-}
-
 impl Bc {
     /// Returns Ok(deserialized data, the amount of data consumed)
     /// Can then use this as the amount that should be remove from a buffer
@@ -132,7 +125,7 @@ fn bc_modern_msg<'a>(
     // Now we'll take the buffer that Nom gave a ref to and parse it.
     let extension = if ext_len > 0 {
         if context.debug {
-            println!(
+            log::debug!(
                 "Extension Txt: {:?}",
                 String::from_utf8(processed_ext_buf.to_vec()).unwrap_or("Not Text".to_string())
             );
@@ -225,12 +218,12 @@ fn bc_modern_msg<'a>(
         } else {
             if context.debug {
                 if is_file_info_list_message(header.msg_id) {
-                    println!(
+                    log::debug!(
                         "Payload Txt: <FileInfoList redacted, {} bytes>",
                         processed_payload_buf.len()
                     );
                 } else {
-                    println!(
+                    log::debug!(
                         "Payload Txt: {:?}",
                         String::from_utf8(processed_payload_buf.to_vec())
                             .unwrap_or("Not Text".to_string())
