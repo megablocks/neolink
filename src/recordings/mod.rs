@@ -140,12 +140,14 @@ fn parse_date(input: &str) -> Result<(u16, u8, u8)> {
     Ok((year, month, day))
 }
 
-// Keep the arithmetic form compatible with Neolink's existing Rust 2021 toolchain.
-#[allow(clippy::manual_is_multiple_of)]
 fn days_in_month(year: u16, month: u8) -> u8 {
     match month {
         4 | 6 | 9 | 11 => 30,
-        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 if year.rem_euclid(400) == 0
+            || (year.rem_euclid(4) == 0 && year.rem_euclid(100) != 0) =>
+        {
+            29
+        }
         2 => 28,
         _ => 31,
     }

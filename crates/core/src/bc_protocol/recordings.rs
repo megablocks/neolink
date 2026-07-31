@@ -11,6 +11,7 @@ pub use crate::bc::xml::FileDateTime;
 const FILE_INFO_LIST_VERSION: &str = "1.1";
 const FILE_INFO_LIST_HOST_CHANNEL: u8 = 250;
 const RECORDING_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+const RECORDING_UID_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const TYPICAL_PAGE_SIZE: usize = 40;
 
 /// Default maximum number of FileInfoList pages requested in one search.
@@ -276,25 +277,21 @@ impl BcCamera {
     /// completed code path, including pagination errors and configured safety
     /// ceilings. Cancelling the future can interrupt that cleanup.
     ///
-    /// The device UID is resolved through [`Self::uid`]; callers select the
-    /// logical device channel through [`RecordingSearchOptions::channel`].
+    /// A non-empty UID supplied through [`super::BcCameraOpt`] is reused
+    /// directly. Otherwise the UID is queried for
+    /// [`RecordingSearchOptions::channel`] with a fixed timeout. UID resolution
+    /// completes before the camera's stateful recording cursor lock is taken.
     pub async fn search_recordings(
         &self,
         options: RecordingSearchOptions,
     ) -> Result<RecordingSearchResult> {
-        options.validate()?;
-        with_recording_lock(&self.recording_search_lock, async {
-            let uid = self.uid().await?;
-            let uid = uid.trim().to_owned();
-            if uid.is_empty() {
-                return Err(Error::Other("Camera returned an empty UID"));
-            }
-            let request = SearchRequest { uid, options };
-            execute_search(request, |msg_id, payload| {
-                self.send_file_info_list(msg_id, payload)
-            })
-            .await
-        })
+        search_recordings_with(
+            self.configured_uid.as_deref(),
+            options,
+            &self.recording_search_lock,
+            |channel| self.uid_for_channel(channel),
+            |msg_id, payload| self.send_file_info_list(msg_id, payload),
+        )
         .await
     }
 
@@ -382,6 +379,57 @@ async fn with_recording_lock<T>(
 ) -> T {
     let _guard = lock.lock().await;
     operation.await
+}
+
+async fn search_recordings_with<Resolve, ResolveFut, Send, SendFut>(
+    configured_uid: Option<&str>,
+    options: RecordingSearchOptions,
+    recording_search_lock: &tokio::sync::Mutex<()>,
+    discover_uid: Resolve,
+    send: Send,
+) -> Result<RecordingSearchResult>
+where
+    Resolve: FnOnce(u8) -> ResolveFut,
+    ResolveFut: Future<Output = Result<String>>,
+    Send: FnMut(u32, FileInfoList) -> SendFut,
+    SendFut: Future<Output = Result<FileInfoCommandReply>>,
+{
+    options.validate()?;
+    let channel = options.channel;
+    let uid = resolve_recording_uid(
+        configured_uid,
+        channel,
+        RECORDING_UID_DISCOVERY_TIMEOUT,
+        discover_uid,
+    )
+    .await?;
+    let request = SearchRequest { uid, options };
+
+    with_recording_lock(recording_search_lock, execute_search(request, send)).await
+}
+
+async fn resolve_recording_uid<Resolve, ResolveFut>(
+    configured_uid: Option<&str>,
+    channel: u8,
+    timeout: Duration,
+    discover_uid: Resolve,
+) -> Result<String>
+where
+    Resolve: FnOnce(u8) -> ResolveFut,
+    ResolveFut: Future<Output = Result<String>>,
+{
+    if let Some(uid) = configured_uid.map(str::trim).filter(|uid| !uid.is_empty()) {
+        return Ok(uid.to_owned());
+    }
+
+    let discovered_uid = tokio::time::timeout(timeout, discover_uid(channel))
+        .await
+        .map_err(|_| Error::TimeoutDisconnected)??;
+    let discovered_uid = discovered_uid.trim();
+    if discovered_uid.is_empty() {
+        return Err(Error::Other("Camera returned an empty UID"));
+    }
+    Ok(discovered_uid.to_owned())
 }
 
 async fn execute_search<F, Fut>(
@@ -637,12 +685,14 @@ fn valid_datetime(value: FileDateTime) -> bool {
         && value.second <= 59
 }
 
-// Keep the arithmetic form compatible with Neolink's existing Rust 2021 toolchain.
-#[allow(clippy::manual_is_multiple_of)]
 fn days_in_month(year: u16, month: u8) -> u8 {
     match month {
         4 | 6 | 9 | 11 => 30,
-        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 if year.rem_euclid(400) == 0
+            || (year.rem_euclid(4) == 0 && year.rem_euclid(100) != 0) =>
+        {
+            29
+        }
         2 => 28,
         _ => 31,
     }
@@ -655,7 +705,7 @@ mod tests {
     use std::{
         cell::RefCell,
         collections::VecDeque,
-        future::ready,
+        future::{pending, ready},
         rc::Rc,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
@@ -791,6 +841,116 @@ mod tests {
 
         let page = build_page_request(&request, 17);
         assert_eq!(page.file_info[0].uid.as_deref(), Some("FIXTUREUID"));
+    }
+
+    #[tokio::test]
+    async fn configured_uid_is_trimmed_and_avoids_discovery() {
+        let discovery_calls = AtomicUsize::new(0);
+        let uid = resolve_recording_uid(
+            Some("  CONFIGUREDUID  "),
+            9,
+            Duration::from_millis(1),
+            |_: u8| {
+                discovery_calls.fetch_add(1, Ordering::SeqCst);
+                ready(Ok("DISCOVEREDUID".to_owned()))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(uid, "CONFIGUREDUID");
+        assert_eq!(discovery_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn uid_discovery_uses_query_channel_and_trims_reply() {
+        let resolved_channel = AtomicUsize::new(usize::MAX);
+        let uid = resolve_recording_uid(None, 17, Duration::from_secs(1), |channel| {
+            resolved_channel.store(usize::from(channel), Ordering::SeqCst);
+            ready(Ok("  DISCOVEREDUID  ".to_owned()))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(uid, "DISCOVEREDUID");
+        assert_eq!(resolved_channel.load(Ordering::SeqCst), 17);
+    }
+
+    #[tokio::test]
+    async fn uid_discovery_is_bounded_and_preserves_camera_errors() {
+        let timed_out = resolve_recording_uid(None, 3, Duration::from_millis(1), |_| {
+            pending::<Result<String>>()
+        })
+        .await;
+        assert!(matches!(timed_out, Err(Error::TimeoutDisconnected)));
+
+        let camera_error = resolve_recording_uid(None, 3, Duration::from_secs(1), |_| {
+            ready(Err(Error::CameraServiceUnavailable {
+                id: MSG_ID_UID,
+                code: 500,
+            }))
+        })
+        .await;
+        assert!(matches!(
+            camera_error,
+            Err(Error::CameraServiceUnavailable {
+                id: MSG_ID_UID,
+                code: 500
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn uid_discovery_completes_before_cursor_lock_is_taken() {
+        let lock = tokio::sync::Mutex::new(());
+        let discovery_started = Rc::new(tokio::sync::Notify::new());
+        let release_discovery = Rc::new(tokio::sync::Notify::new());
+        let replies = Rc::new(RefCell::new(VecDeque::from(vec![
+            Ok(open_reply()),
+            Ok(FileInfoCommandReply::Empty),
+            Ok(FileInfoCommandReply::Empty),
+        ])));
+
+        let search = search_recordings_with(
+            None,
+            options(),
+            &lock,
+            {
+                let discovery_started = discovery_started.clone();
+                let release_discovery = release_discovery.clone();
+                move |channel| async move {
+                    assert_eq!(channel, 0);
+                    discovery_started.notify_one();
+                    release_discovery.notified().await;
+                    Ok("DISCOVEREDUID".to_owned())
+                }
+            },
+            {
+                let replies = replies.clone();
+                move |_msg_id, _payload| {
+                    ready(
+                        replies
+                            .borrow_mut()
+                            .pop_front()
+                            .expect("mock reply for every command"),
+                    )
+                }
+            },
+        );
+        let lock_probe = async {
+            discovery_started.notified().await;
+            let guard = tokio::time::timeout(Duration::from_millis(100), lock.lock())
+                .await
+                .expect("UID discovery must not hold the recording cursor lock");
+            drop(guard);
+            release_discovery.notify_one();
+        };
+
+        let (result, ()) = tokio::join!(search, lock_probe);
+        let result = result.unwrap();
+        assert!(result.entries.is_empty());
+        assert_eq!(result.end, RecordingSearchEnd::ShortPage);
+        assert!(replies.borrow().is_empty());
     }
 
     #[test]

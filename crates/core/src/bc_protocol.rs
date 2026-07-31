@@ -86,6 +86,9 @@ enum ReadKind {
 ///
 pub struct BcCamera {
     channel_id: u8,
+    /// UID supplied when the camera was constructed, normalized for reuse by
+    /// commands that would otherwise need to query it from the device.
+    configured_uid: Option<String>,
     connection: Arc<BcConnection>,
     logged_in: AtomicBool,
     message_num: AtomicU16,
@@ -397,6 +400,12 @@ impl BcCamera {
             connection: Arc::new(conn),
             message_num: AtomicU16::new(0),
             channel_id: options.channel_id,
+            configured_uid: options
+                .uid
+                .as_deref()
+                .map(str::trim)
+                .filter(|uid| !uid.is_empty())
+                .map(str::to_owned),
             logged_in: AtomicBool::new(false),
             credentials: Credentials::new(username, passwd),
             abilities: Default::default(),
