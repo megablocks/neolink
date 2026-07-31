@@ -265,6 +265,24 @@ pub enum Error {
         close: std::sync::Arc<Error>,
     },
 
+    /// A stored-recording replay ended, but its STOP command failed.
+    #[error("Recording replay stop failed: {stop}")]
+    RecordingReplayStopFailed {
+        /// The STOP error, retained for programmatic inspection.
+        #[source]
+        stop: std::sync::Arc<Error>,
+    },
+
+    /// A stored-recording replay failed and its STOP command also failed.
+    #[error("Recording replay failed: {replay}; stop also failed: {stop}")]
+    RecordingReplayAndStopFailed {
+        /// The original replay error.
+        #[source]
+        replay: std::sync::Arc<Error>,
+        /// The STOP error.
+        stop: std::sync::Arc<Error>,
+    },
+
     /// Raised when a thread panics
     #[error("Thread panicked")]
     JoinError(#[from] std::sync::Arc<tokio::task::JoinError>),

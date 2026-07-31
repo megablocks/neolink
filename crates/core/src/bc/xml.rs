@@ -222,6 +222,12 @@ pub struct FileInfo {
     /// Requested stream type.
     #[serde(rename = "streamType", skip_serializing_if = "Option::is_none")]
     pub stream_type: Option<String>,
+    /// Whether a replay request permits the sub stream.
+    #[serde(rename = "supportSub", skip_serializing_if = "Option::is_none")]
+    pub support_sub: Option<u8>,
+    /// Stored-recording replay speed.
+    #[serde(rename = "playSpeed", skip_serializing_if = "Option::is_none")]
+    pub play_speed: Option<u8>,
     /// Requested or returned recording class.
     #[serde(rename = "recordType", skip_serializing_if = "Option::is_none")]
     pub record_type: Option<String>,

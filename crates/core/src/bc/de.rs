@@ -18,12 +18,23 @@ type IResult<I, O, E = nom_language::error::VerboseError<I>> = Result<(I, O), no
 /// payloads, and large transfers (snapshots, firmware) are chunked across many
 /// messages rather than sent as one giant body — while still rejecting clearly
 /// malicious lengths.
-const MAX_BODY_LEN: u32 = 16 * 1024 * 1024;
+pub(crate) const MAX_BODY_LEN: u32 = 16 * 1024 * 1024;
 
 impl Bc {
     /// Returns Ok(deserialized data, the amount of data consumed)
     /// Can then use this as the amount that should be remove from a buffer
+    #[cfg(test)]
     pub(crate) fn deserialize(context: &BcContext, buf: &mut BytesMut) -> Result<Bc, Error> {
+        Self::deserialize_with_wire_body_len(context, buf).map(|(message, _)| message)
+    }
+
+    /// Deserialize one message while preserving the exact wire body length
+    /// validated by the parser. Queue accounting must not reconstruct this from
+    /// decoded XML/extension structures, which can undercount their allocations.
+    pub(crate) fn deserialize_with_wire_body_len(
+        context: &BcContext,
+        buf: &mut BytesMut,
+    ) -> Result<(Bc, u32), Error> {
         let (result, amount) = match consumed(|buf| bc_msg(context, buf)).parse(buf) {
             Ok((_, (parsed_buff, result))) => Ok((result, parsed_buff.len())),
             Err(e) => Err(Error::from(e)),
@@ -34,16 +45,17 @@ impl Bc {
     }
 }
 
-fn bc_msg<'a>(context: &BcContext, buf: &'a [u8]) -> IResult<&'a [u8], Bc> {
+fn bc_msg<'a>(context: &BcContext, buf: &'a [u8]) -> IResult<&'a [u8], (Bc, u32)> {
     let (buf, header) = bc_header(buf)?;
     let (buf, body) = bc_body(context, &header, buf)?;
+    let wire_body_len = header.body_len;
 
     let bc = Bc {
         meta: header.to_meta(),
         body,
     };
 
-    Ok((buf, bc))
+    Ok((buf, (bc, wire_body_len)))
 }
 
 fn bc_body<'a>(context: &BcContext, header: &BcHeader, buf: &'a [u8]) -> IResult<&'a [u8], BcBody> {
@@ -351,6 +363,19 @@ mod tests {
             }) => assert_eq!(encryption.nonce, "9E6D1FCB9E69846D"),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn deserializer_preserves_validated_wire_body_length() {
+        let sample = include_bytes!("samples/model_sample_modern_login.bin");
+        let context = BcContext::new_with_encryption(EncryptionProtocol::BCEncrypt);
+        let mut bytes = BytesMut::from(&sample[..]);
+
+        let (_message, wire_body_len) =
+            Bc::deserialize_with_wire_body_len(&context, &mut bytes).unwrap();
+
+        assert_eq!(wire_body_len, 145);
+        assert!(bytes.is_empty());
     }
 
     #[test]

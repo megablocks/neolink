@@ -18,6 +18,10 @@ pub const MSG_ID_LOGOUT: u32 = 2;
 pub const MSG_ID_VIDEO: u32 = 3;
 /// ID used to stop the video stream
 pub const MSG_ID_VIDEO_STOP: u32 = 4;
+/// Start replaying one stored recording as a pushed BcMedia stream.
+pub const MSG_ID_FILE_INFO_LIST_REPLAY: u32 = 5;
+/// Stop a stored-recording replay stream.
+pub const MSG_ID_FILE_INFO_LIST_STOP: u32 = 7;
 /// TalkAbility messages have this ID
 pub const MSG_ID_TALKABILITY: u32 = 10;
 /// TalkReset messages have this ID
@@ -33,7 +37,11 @@ pub const MSG_ID_FILE_INFO_LIST_CLOSE: u32 = 16;
 pub(crate) fn is_file_info_list_message(msg_id: u32) -> bool {
     matches!(
         msg_id,
-        MSG_ID_FILE_INFO_LIST_OPEN | MSG_ID_FILE_INFO_LIST_GET | MSG_ID_FILE_INFO_LIST_CLOSE
+        MSG_ID_FILE_INFO_LIST_REPLAY
+            | MSG_ID_FILE_INFO_LIST_STOP
+            | MSG_ID_FILE_INFO_LIST_OPEN
+            | MSG_ID_FILE_INFO_LIST_GET
+            | MSG_ID_FILE_INFO_LIST_CLOSE
     )
 }
 

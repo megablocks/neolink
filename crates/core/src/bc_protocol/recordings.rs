@@ -11,7 +11,7 @@ pub use crate::bc::xml::FileDateTime;
 const FILE_INFO_LIST_VERSION: &str = "1.1";
 const FILE_INFO_LIST_HOST_CHANNEL: u8 = 250;
 const RECORDING_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
-const RECORDING_UID_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const RECORDING_UID_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const TYPICAL_PAGE_SIZE: usize = 40;
 
 /// Default maximum number of FileInfoList pages requested in one search.
@@ -408,7 +408,7 @@ where
     with_recording_lock(recording_search_lock, execute_search(request, send)).await
 }
 
-async fn resolve_recording_uid<Resolve, ResolveFut>(
+pub(super) async fn resolve_recording_uid<Resolve, ResolveFut>(
     configured_uid: Option<&str>,
     channel: u8,
     timeout: Duration,

@@ -1279,7 +1279,8 @@ impl Discovery {
 
         let _bc: Bc = timeout(*TCP_WAIT, tcp_source.next())
             .await?
-            .ok_or(Error::CannotInitCamera)??; // Successful recv should mean a Bc packet if not then deser will fail
+            .ok_or(Error::CannotInitCamera)??
+            .message; // Successful recv should mean a Bc packet if not then deser will fail
         Ok(())
     }
 
