@@ -5,7 +5,9 @@
 # Copyright (c) 2026 privatecoder
 # SPDX-License-Identifier: AGPL-3.0-only
 
-FROM docker.io/rust:slim-bookworm AS build-base
+# Multi-arch OCI index resolved from docker.io/library/rust:slim-bookworm on
+# 2026-07-31 UTC; pin the index (not an architecture-specific child manifest).
+FROM docker.io/rust:slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 AS build-base
 ARG TARGETPLATFORM
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -52,16 +54,27 @@ RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
   fi
 
 # Create the release container. Match the base OS used to build
-FROM debian:bookworm-slim
+# Multi-arch OCI index resolved from docker.io/library/debian:bookworm-slim on
+# 2026-07-31 UTC; pin the index (not an architecture-specific child manifest).
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 ARG TARGETPLATFORM
 ARG REPO
 ARG VERSION
 ARG OWNER
+ARG REVISION
+
+RUN case "$REVISION" in \
+      ''|*[!0-9a-f]*) echo "REVISION must be an exact lowercase commit SHA" >&2; exit 1 ;; \
+    esac && \
+    test "${#REVISION}" -eq 40
 
 LABEL description="An image for the neolink program which is a reolink camera to rtsp translator"
 LABEL repository="$REPO"
 LABEL version="$VERSION"
 LABEL maintainer="$OWNER"
+LABEL org.opencontainers.image.revision="$REVISION"
+LABEL org.opencontainers.image.source="$REPO"
+LABEL org.opencontainers.image.version="$VERSION"
 
 # hadolint ignore=DL3008
 RUN apt-get update && \

@@ -4,10 +4,11 @@ use super::{
 };
 use crate::{
     bc::{model::*, xml::*},
+    bcmedia::codex::BcMediaCodex,
     bcmedia::de::MAX_MEDIA_PAYLOAD,
     bcmedia::model::BcMedia,
 };
-use futures::StreamExt;
+use bytes::BytesMut;
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::{
@@ -22,7 +23,7 @@ use tokio::{
     sync::{mpsc, oneshot, OwnedMutexGuard},
     task::JoinHandle,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{codec::Decoder, sync::CancellationToken};
 
 const FILE_INFO_LIST_VERSION: &str = "1.1";
 const REPLAY_MESSAGE_CLASS: u16 = 0x6414;
@@ -38,7 +39,14 @@ const HARD_REPLAY_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 // bounded STOP/connection teardown instead of silently dropping media bytes.
 const REPLAY_RAW_SUBSCRIPTION_CAPACITY: usize = 128;
 const REPLAY_RAW_MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
-const HARD_REPLAY_BUFFER_SIZE: usize = 32;
+// One video packet can contain an additional header and a payload, each capped
+// at MAX_MEDIA_PAYLOAD, plus its fixed prefix and alignment padding. Incoming
+// BC binary envelopes are appended incrementally and decoded between slices so
+// valid read-ahead never requires retaining the whole following envelope beside
+// a near-maximum incomplete packet.
+const REPLAY_DECODE_BUFFER_MAX_BYTES: usize = (MAX_MEDIA_PAYLOAD as usize * 2) + 64;
+/// Hard maximum decoded packet count for one recording-replay consumer queue.
+pub const HARD_RECORDING_REPLAY_BUFFER_SIZE: usize = 32;
 
 /// Default maximum wall time for one stored-recording replay session.
 pub const DEFAULT_RECORDING_REPLAY_MAX_DURATION: Duration = Duration::from_secs(15 * 60);
@@ -143,7 +151,7 @@ impl RecordingReplayOptions {
                 "Recording replay buffered-byte limit is outside its safety ceiling",
             ));
         }
-        if !(1..=HARD_REPLAY_BUFFER_SIZE).contains(&self.buffer_size) {
+        if !(1..=HARD_RECORDING_REPLAY_BUFFER_SIZE).contains(&self.buffer_size) {
             return Err(Error::Other(
                 "Recording replay buffer is outside its safety ceiling",
             ));
@@ -297,29 +305,21 @@ impl QueuedMedia {
 /// retained read-ahead; 16 MiB for the transient decrypt/`to_vec` buffer (the
 /// current decrypt implementation allocates even for unencrypted input); 16 MiB
 /// for the parsed envelope owned by the source while it waits for ingress
-/// permits; 16 MiB for one raw envelope already dequeued into the async-reader
-/// adapter after its raw-queue reservation is released during that ownership
-/// transfer; 32 MiB for one BcMedia frame being buffered (independently capped
-/// 16 MiB additional header plus 16 MiB payload); and 16 MiB for one decoded
-/// producer packet before it can obtain a decoded-queue reservation. Retained
-/// ingress/raw reservation ownership transitions are not counted again.
+/// permits; 16 MiB for one raw BC binary envelope already dequeued after its
+/// raw-queue reservation is released during that ownership transfer; a fixed
+/// `REPLAY_DECODE_BUFFER_MAX_BYTES` of approximately 32 MiB for one incomplete
+/// BcMedia frame (16 MiB additional header plus 16 MiB payload and fixed
+/// framing); and 16 MiB for one decoded producer packet before it can obtain a
+/// decoded-queue reservation. Retained ingress/raw reservation ownership
+/// transitions are not counted again.
 ///
-/// For the locked `tokio-util` 0.7.18 state machine, `reserve(1)` exposes the
-/// entire remaining `BytesMut` chunk to one `poll_read_buf` before decoding.
-/// Consuming frames advances the view without shrinking its retained backing
-/// allocation. With Rust 1.88's amortized doubling and `bytes` 1.11.1's
-/// in-place-reclaim rule (`offset >= len`), a 32 MiB backing buffer can grow to
-/// 64 MiB: after earlier frames consume just under 16 MiB, an incomplete maximum
-/// body plus fixed header can leave `len` just over 16 MiB, so `offset < len`
-/// prevents reclaim and `reserve(1)` doubles the allocation.
-///
-/// That 64 MiB step is final. Whenever a 64 MiB view needs more input, any
-/// incomplete valid BC suffix is smaller than a 16 MiB body plus its fixed
-/// header, and therefore smaller than half the backing buffer. The view either
-/// already has tail capacity or its consumed offset is greater than its length,
-/// allowing in-place reclaim instead of growth to 128 MiB. The decoder's error
-/// path likewise advances to the next magic or drops all but a three-byte
-/// boundary tail before requesting more input.
+/// Replay observes each BC envelope directly so command-5 response code 201 is
+/// not lost. Each bounded binary envelope is appended to the persistent
+/// BcMedia decoder in available-room slices, and complete media packets are
+/// drained between slices. Consequently, read-ahead from a following frame is
+/// decoded without co-buffering the whole incoming envelope beside a
+/// near-maximum incomplete frame. If the fixed decoder buffer is full and still
+/// requires input, replay terminates observably rather than growing the buffer.
 ///
 /// The resulting conservative protocol-owned logical-payload ceiling is:
 /// 64 MiB ingress + 64 MiB raw queue + 32 MiB default decoded queue + 64 MiB BC
@@ -651,47 +651,93 @@ async fn run_replay_session(
         let mut delivered_bytes = 0u64;
         let deadline = tokio::time::sleep(options.max_duration);
         tokio::pin!(deadline);
-        let mut media = subscription.bcmedia_stream(options.strict);
+        let mut media_decoder = BcMediaCodex::new(options.strict);
+        let mut media_buffer = BytesMut::new();
 
         loop {
-            let packet = tokio::select! {
+            let message = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Ok(RecordingReplayEnd::Cancelled),
                 _ = &mut deadline => return Ok(RecordingReplayEnd::DurationLimit),
                 _ = raw_overflow.cancelled() => return Ok(RecordingReplayEnd::ConsumerStalled),
-                packet = media.next() => packet,
+                message = subscription.recv() => message?,
             };
-            let packet = match packet {
-                Some(packet) => packet?,
-                None => return Ok(RecordingReplayEnd::CameraEnd),
-            };
-            let packet_bytes = media_payload_len(&packet);
-            let Some(next_bytes) = delivered_bytes.checked_add(packet_bytes) else {
-                return Ok(RecordingReplayEnd::ByteLimit);
-            };
-            if next_bytes > options.max_media_bytes {
-                return Ok(RecordingReplayEnd::ByteLimit);
+
+            let response_code = message.meta.response_code;
+            if (400..60_000).contains(&response_code) {
+                return Err(Error::CameraServiceUnavailable {
+                    id: MSG_ID_FILE_INFO_LIST_REPLAY,
+                    code: response_code,
+                });
             }
 
-            let Some(reservation) = byte_budget.try_reserve(packet_bytes) else {
-                return Ok(RecordingReplayEnd::BufferLimit);
+            let binary = match message.body {
+                BcBody::ModernMsg(ModernMsg {
+                    payload: Some(BcPayloads::Binary(data)),
+                    ..
+                }) => Some(data),
+                _ => None,
             };
-            match media_tx.try_send(QueuedMedia::media(packet, reservation)) {
-                Ok(()) => {
-                    delivered_bytes = next_bytes;
-                    // A single raw BC envelope can contain many decoded media
-                    // packets. Yield after each successful enqueue so a ready
-                    // consumer can drain between packets instead of being
-                    // declared stalled solely because this producer kept the
-                    // executor for an entire burst.
-                    tokio::task::yield_now().await;
+            if let Some(binary) = binary {
+                let mut binary_offset = 0usize;
+                loop {
+                    while let Some(packet) = media_decoder.decode(&mut media_buffer)? {
+                        let packet_bytes = media_payload_len(&packet);
+                        let Some(next_bytes) = delivered_bytes.checked_add(packet_bytes) else {
+                            return Ok(RecordingReplayEnd::ByteLimit);
+                        };
+                        if next_bytes > options.max_media_bytes {
+                            return Ok(RecordingReplayEnd::ByteLimit);
+                        }
+
+                        let Some(reservation) = byte_budget.try_reserve(packet_bytes) else {
+                            return Ok(RecordingReplayEnd::BufferLimit);
+                        };
+                        match media_tx.try_send(QueuedMedia::media(packet, reservation)) {
+                            Ok(()) => {
+                                delivered_bytes = next_bytes;
+                                // A single raw BC envelope can contain many decoded media
+                                // packets. Yield after each successful enqueue so a ready
+                                // consumer can drain between packets instead of being
+                                // declared stalled solely because this producer kept the
+                                // executor for an entire burst.
+                                tokio::task::yield_now().await;
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                return Ok(RecordingReplayEnd::ConsumerStalled);
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                return Ok(RecordingReplayEnd::ClientDisconnected);
+                            }
+                        }
+                    }
+
+                    if binary_offset == binary.len() {
+                        break;
+                    }
+                    let room = REPLAY_DECODE_BUFFER_MAX_BYTES
+                        .checked_sub(media_buffer.len())
+                        .ok_or(Error::Other(
+                            "Recording replay decoder buffer limit exceeded",
+                        ))?;
+                    if room == 0 {
+                        return Err(Error::Other(
+                            "Recording replay decoder buffer limit exceeded",
+                        ));
+                    }
+                    let amount = room.min(binary.len() - binary_offset);
+                    media_buffer.extend_from_slice(&binary[binary_offset..binary_offset + amount]);
+                    binary_offset += amount;
                 }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    return Ok(RecordingReplayEnd::ConsumerStalled);
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return Ok(RecordingReplayEnd::ClientDisconnected);
-                }
+            }
+
+            // Reolink sends 201 after all replay bytes. Some firmwares attach
+            // the final binary chunk to that same envelope, so the chunk above
+            // must be decoded and delivered before reporting clean completion.
+            // Ordinary 200 responses and camera-specific data statuses >=60000
+            // are continuation envelopes.
+            if response_code == 201 {
+                return Ok(RecordingReplayEnd::CameraEnd);
             }
         }
     }
@@ -889,7 +935,7 @@ mod tests {
     };
     use futures::{
         channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
-        SinkExt,
+        SinkExt, StreamExt,
     };
     use std::{
         collections::{HashMap, HashSet},
@@ -1040,6 +1086,19 @@ mod tests {
         .unwrap()
     }
 
+    fn iframe_with_additional_header(payload_bytes: usize, header_bytes: usize) -> Vec<u8> {
+        let mut plain = iframe(payload_bytes);
+        let current_header_bytes = u32::from_le_bytes(plain[12..16].try_into().unwrap()) as usize;
+        assert!(header_bytes >= current_header_bytes);
+        plain[12..16].copy_from_slice(&(header_bytes as u32).to_le_bytes());
+        let mut expanded = Vec::with_capacity(plain.len() + header_bytes);
+        let payload_offset = 24 + current_header_bytes;
+        expanded.extend_from_slice(&plain[..payload_offset]);
+        expanded.resize(24 + header_bytes, 0);
+        expanded.extend_from_slice(&plain[payload_offset..]);
+        expanded
+    }
+
     fn file_info(message: &Bc) -> &FileInfo {
         match &message.body {
             BcBody::ModernMsg(ModernMsg {
@@ -1120,6 +1179,38 @@ mod tests {
         1
     }
 
+    async fn expect_stop_once(
+        outbound: &mut UnboundedReceiver<Bc>,
+        inbound: &TestInbound,
+        response_code: u16,
+    ) -> Bc {
+        let stop = timeout(TEST_TIMEOUT, outbound.next())
+            .await
+            .expect("STOP command timeout")
+            .expect("STOP command");
+        assert_eq!(stop.meta.msg_id, MSG_ID_FILE_INFO_LIST_STOP);
+        inbound
+            .unbounded_send(Ok(modern_reply(&stop, response_code, None)))
+            .unwrap();
+        assert!(
+            matches!(
+                timeout(Duration::from_millis(20), outbound.next()).await,
+                Err(_) | Ok(None)
+            ),
+            "replay teardown must send STOP exactly once"
+        );
+        stop
+    }
+
+    async fn expect_replay_start(outbound: &mut UnboundedReceiver<Bc>) -> Bc {
+        let start = timeout(TEST_TIMEOUT, outbound.next())
+            .await
+            .expect("START command timeout")
+            .expect("START command");
+        assert_eq!(start.meta.msg_id, MSG_ID_FILE_INFO_LIST_REPLAY);
+        start
+    }
+
     #[test]
     fn stop_token_accepts_supported_names_without_exposing_them_in_errors() {
         assert_eq!(
@@ -1162,7 +1253,7 @@ mod tests {
         };
         assert!(value.validate().is_err());
         let value = RecordingReplayOptions {
-            buffer_size: HARD_REPLAY_BUFFER_SIZE + 1,
+            buffer_size: HARD_RECORDING_REPLAY_BUFFER_SIZE + 1,
             ..Default::default()
         };
         assert!(value.validate().is_err());
@@ -1350,6 +1441,273 @@ mod tests {
             );
             assert_eq!(device.await.unwrap(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn header_only_201_is_a_clean_camera_end_and_stops_once() {
+        let (camera, mut outbound, inbound) = test_camera(0).await;
+        let device = tokio::spawn(async move {
+            let start = expect_replay_start(&mut outbound).await;
+            inbound
+                .unbounded_send(Ok(modern_reply(&start, 200, None)))
+                .unwrap();
+            inbound
+                .unbounded_send(Ok(modern_reply(&start, 201, None)))
+                .unwrap();
+            expect_stop_once(&mut outbound, &inbound, 200).await;
+        });
+
+        let mut replay = camera
+            .start_recording_replay(&entry(), options(0))
+            .await
+            .unwrap();
+        assert!(matches!(
+            replay.get_data().await,
+            Err(Error::StreamFinished)
+        ));
+        assert_eq!(
+            replay.shutdown().await.unwrap(),
+            RecordingReplayEnd::CameraEnd
+        );
+        device.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn binary_on_201_is_delivered_before_clean_camera_end() {
+        let (camera, mut outbound, inbound) = test_camera(0).await;
+        let device = tokio::spawn(async move {
+            let start = expect_replay_start(&mut outbound).await;
+            inbound
+                .unbounded_send(Ok(modern_reply(&start, 200, None)))
+                .unwrap();
+            inbound
+                .unbounded_send(Ok(modern_reply(
+                    &start,
+                    201,
+                    Some(BcPayloads::Binary(iframe(7))),
+                )))
+                .unwrap();
+            expect_stop_once(&mut outbound, &inbound, 200).await;
+        });
+
+        let mut replay = camera
+            .start_recording_replay(&entry(), options(0))
+            .await
+            .unwrap();
+        match replay.get_data().await.unwrap().unwrap() {
+            BcMedia::Iframe(frame) => assert_eq!(frame.data, vec![0x55; 7]),
+            other => panic!("expected final I-frame, got {other:?}"),
+        }
+        assert!(matches!(
+            replay.get_data().await,
+            Err(Error::StreamFinished)
+        ));
+        assert_eq!(
+            replay.shutdown().await.unwrap(),
+            RecordingReplayEnd::CameraEnd
+        );
+        device.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn camera_specific_60052_data_status_continues_until_201() {
+        let (camera, mut outbound, inbound) = test_camera(0).await;
+        let device = tokio::spawn(async move {
+            let start = expect_replay_start(&mut outbound).await;
+            inbound
+                .unbounded_send(Ok(modern_reply(&start, 200, None)))
+                .unwrap();
+            inbound
+                .unbounded_send(Ok(modern_reply(
+                    &start,
+                    60_052,
+                    Some(BcPayloads::Binary(iframe(3))),
+                )))
+                .unwrap();
+            inbound
+                .unbounded_send(Ok(modern_reply(
+                    &start,
+                    201,
+                    Some(BcPayloads::Binary(iframe(4))),
+                )))
+                .unwrap();
+            expect_stop_once(&mut outbound, &inbound, 200).await;
+        });
+
+        let mut replay = camera
+            .start_recording_replay(&entry(), options(0))
+            .await
+            .unwrap();
+        let mut lengths = Vec::new();
+        while let Ok(Ok(BcMedia::Iframe(frame))) = replay.get_data().await {
+            lengths.push(frame.data.len());
+        }
+        assert_eq!(lengths, vec![3, 4]);
+        assert_eq!(
+            replay.shutdown().await.unwrap(),
+            RecordingReplayEnd::CameraEnd
+        );
+        device.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn near_cap_split_frame_allows_next_frame_read_ahead_without_false_overflow() {
+        let (camera, mut outbound, inbound) = test_camera(0).await;
+        let device = tokio::spawn(async move {
+            let start = expect_replay_start(&mut outbound).await;
+            inbound
+                .unbounded_send(Ok(modern_reply(&start, 200, None)))
+                .unwrap();
+
+            let large_payload = MAX_MEDIA_PAYLOAD as usize - 512;
+            let large_header = MAX_MEDIA_PAYLOAD as usize - 512;
+            let large = iframe_with_additional_header(large_payload, large_header);
+            let next_payload = MAX_MEDIA_PAYLOAD as usize - 1024;
+            let next = iframe(next_payload);
+            let first_end = MAX_MEDIA_PAYLOAD as usize;
+            let second_end = large.len() - 64;
+            assert!(second_end > first_end);
+            assert!(second_end - first_end <= MAX_MEDIA_PAYLOAD as usize);
+            let mut final_envelope = large[second_end..].to_vec();
+            final_envelope.extend_from_slice(&next);
+            assert!(final_envelope.len() <= MAX_MEDIA_PAYLOAD as usize);
+
+            inbound
+                .unbounded_send(Ok(binary_message(&start, large[..first_end].to_vec())))
+                .unwrap();
+            inbound
+                .unbounded_send(Ok(binary_message(
+                    &start,
+                    large[first_end..second_end].to_vec(),
+                )))
+                .unwrap();
+            inbound
+                .unbounded_send(Ok(modern_reply(
+                    &start,
+                    201,
+                    Some(BcPayloads::Binary(final_envelope)),
+                )))
+                .unwrap();
+            expect_stop_once(&mut outbound, &inbound, 200).await;
+        });
+
+        let mut replay_options = options(0);
+        replay_options.max_duration = Duration::from_secs(2);
+        replay_options.max_media_bytes = HARD_RECORDING_REPLAY_MAX_BUFFERED_MEDIA_BYTES;
+        replay_options.max_buffered_media_bytes = HARD_RECORDING_REPLAY_MAX_BUFFERED_MEDIA_BYTES;
+        let mut replay = camera
+            .start_recording_replay(&entry(), replay_options)
+            .await
+            .unwrap();
+        let first = replay.get_data().await.unwrap().unwrap();
+        let second = replay.get_data().await.unwrap().unwrap();
+        assert_eq!(media_payload_len(&first), MAX_MEDIA_PAYLOAD as u64 - 512);
+        assert_eq!(media_payload_len(&second), MAX_MEDIA_PAYLOAD as u64 - 1024);
+        assert!(matches!(
+            replay.get_data().await,
+            Err(Error::StreamFinished)
+        ));
+        assert_eq!(
+            replay.shutdown().await.unwrap(),
+            RecordingReplayEnd::CameraEnd
+        );
+        device.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_error_before_201_is_preserved_when_stop_connection_is_already_gone() {
+        let (camera, mut outbound, inbound) = test_camera(0).await;
+        let device = tokio::spawn(async move {
+            let start = expect_replay_start(&mut outbound).await;
+            inbound
+                .unbounded_send(Ok(modern_reply(&start, 200, None)))
+                .unwrap();
+            inbound.unbounded_send(Err(Error::RelayTerminate)).unwrap();
+        });
+
+        let mut replay = camera
+            .start_recording_replay(&entry(), options(0))
+            .await
+            .unwrap();
+        let observed = timeout(TEST_TIMEOUT, replay.get_data())
+            .await
+            .expect("transport-error teardown must be bounded")
+            .expect("queued transport error");
+        match observed {
+            Err(Error::RecordingReplayAndStopFailed { replay, .. }) => {
+                assert!(matches!(replay.as_ref(), Error::RelayTerminate));
+            }
+            other => panic!("unexpected transport/STOP result: {other:?}"),
+        }
+        match timeout(TEST_TIMEOUT, replay.shutdown())
+            .await
+            .expect("transport-error shutdown must be bounded")
+        {
+            Err(Error::RecordingReplayAndStopFailed { replay, .. }) => {
+                assert!(matches!(replay.as_ref(), Error::RelayTerminate));
+            }
+            other => panic!("unexpected transport/STOP shutdown result: {other:?}"),
+        }
+        device.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_error_precedes_failed_stop_and_stop_is_sent_once() {
+        let (camera, mut outbound, inbound) = test_camera(0).await;
+        let device = tokio::spawn(async move {
+            let start = expect_replay_start(&mut outbound).await;
+            inbound
+                .unbounded_send(Ok(modern_reply(&start, 200, None)))
+                .unwrap();
+            inbound
+                .unbounded_send(Ok(modern_reply(&start, 500, None)))
+                .unwrap();
+            expect_stop_once(&mut outbound, &inbound, 501).await;
+        });
+
+        let mut replay = camera
+            .start_recording_replay(&entry(), options(0))
+            .await
+            .unwrap();
+        match replay.get_data().await {
+            Ok(Err(Error::RecordingReplayAndStopFailed { replay, stop })) => {
+                assert!(matches!(
+                    replay.as_ref(),
+                    Error::CameraServiceUnavailable {
+                        id: MSG_ID_FILE_INFO_LIST_REPLAY,
+                        code: 500
+                    }
+                ));
+                assert!(matches!(
+                    stop.as_ref(),
+                    Error::CameraServiceUnavailable {
+                        id: MSG_ID_FILE_INFO_LIST_STOP,
+                        code: 501
+                    }
+                ));
+            }
+            other => panic!("unexpected replay/STOP result: {other:?}"),
+        }
+        match replay.shutdown().await {
+            Err(Error::RecordingReplayAndStopFailed { replay, stop }) => {
+                assert!(matches!(
+                    replay.as_ref(),
+                    Error::CameraServiceUnavailable {
+                        id: MSG_ID_FILE_INFO_LIST_REPLAY,
+                        code: 500
+                    }
+                ));
+                assert!(matches!(
+                    stop.as_ref(),
+                    Error::CameraServiceUnavailable {
+                        id: MSG_ID_FILE_INFO_LIST_STOP,
+                        code: 501
+                    }
+                ));
+            }
+            other => panic!("unexpected replay/STOP shutdown result: {other:?}"),
+        }
+        device.await.unwrap();
     }
 
     #[tokio::test]

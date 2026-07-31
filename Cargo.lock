@@ -1282,6 +1282,7 @@ dependencies = [
  "gstreamer-rtsp",
  "gstreamer-rtsp-server",
  "heck",
+ "libc",
  "log",
  "neolink_core",
  "once_cell",

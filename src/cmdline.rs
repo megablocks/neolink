@@ -25,6 +25,8 @@ pub enum Command {
     Ptz(super::ptz::Opt),
     Recordings(super::recordings::Opt),
     #[cfg(feature = "gstreamer")]
+    RecordingExport(super::recording_export::Opt),
+    #[cfg(feature = "gstreamer")]
     Talk(super::talk::Opt),
     Mqtt(super::mqtt::Opt),
     #[cfg(feature = "gstreamer")]
